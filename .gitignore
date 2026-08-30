@@ -1,0 +1,14 @@
+# Local environment configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.DS_Store
+
+# Local runtime data
+.data/
+artifacts/
