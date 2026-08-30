@@ -6,7 +6,10 @@ import {
   mapTrueForgeTurnState,
   TrueForgeAgentRuntime,
 } from "../../src/adapters/trueforge/trueforge-agent-runtime.js";
-import { AgentTurnSubmissionUnknownError } from "../../src/ports/agent-runtime.js";
+import {
+  AgentSessionSubmissionUnknownError,
+  AgentTurnSubmissionUnknownError,
+} from "../../src/ports/agent-runtime.js";
 
 function createFakeClient() {
   const sessions = {
@@ -174,6 +177,31 @@ describe("TrueForgeAgentRuntime", () => {
       { abortSignal: signal, maxRetries: 0 },
     );
     expect(sessions.createTurn).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an ambiguous session submission as typed and non-retryable", async () => {
+    const { client, sessions } = createFakeClient();
+    const networkError = new Error("connection closed before a response arrived");
+    sessions.create.mockRejectedValueOnce(networkError);
+    const runtime = new TrueForgeAgentRuntime({
+      baseUrl: "http://localhost:8790",
+      client,
+    });
+
+    const caught: unknown = await runtime
+      .createSession(
+        { agent: { kind: "SAVED", agentName: "bizforge-research" } },
+        new AbortController().signal,
+      )
+      .catch((error: unknown) => error);
+
+    expect(caught).toBeInstanceOf(AgentSessionSubmissionUnknownError);
+    expect(caught).toMatchObject({
+      code: "AGENT_SESSION_SUBMISSION_UNKNOWN",
+      retryable: false,
+      agentName: "bizforge-research",
+      cause: networkError,
+    });
   });
 
   it("starts a non-retrying background turn in a persisted session", async () => {

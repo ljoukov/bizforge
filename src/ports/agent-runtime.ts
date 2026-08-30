@@ -21,6 +21,27 @@ export interface AgentTurnReference {
 }
 
 /**
+ * Session creation is non-idempotent. A transport failure can hide a session
+ * that the provider already created, so callers must reconcile by agent/run
+ * metadata rather than blindly creating another session.
+ */
+export class AgentSessionSubmissionUnknownError extends Error {
+  override readonly name = "AgentSessionSubmissionUnknownError";
+  readonly code = "AGENT_SESSION_SUBMISSION_UNKNOWN";
+  readonly retryable = false;
+
+  constructor(
+    readonly agentName: string,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Agent session submission outcome is unknown for ${agentName}; reconcile before resubmitting`,
+      options,
+    );
+  }
+}
+
+/**
  * A turn-creation request may have reached the server even though no response
  * reached the caller. Retrying this error is unsafe until the session is
  * reconciled against provider state.

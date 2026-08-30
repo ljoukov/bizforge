@@ -83,6 +83,20 @@ const makeEvidence = () => ({
   tags: ["video", "university"],
 });
 
+function makeAdditionalEvidence(evidenceId: string, retrievedAt: string) {
+  const evidence = makeEvidence();
+  evidence.evidenceId = evidenceId;
+  evidence.provenance = {
+    ...evidence.provenance,
+    canonicalUrl: `https://example.com/jobs/${evidenceId}`,
+    sourceRecordId: `job-${evidenceId}`,
+    retrievedAt,
+    contentSha256: "b".repeat(64),
+  };
+  evidence.rawArtifactRef = `raw/snapshot-1/${evidenceId}.json`;
+  return evidence;
+}
+
 const makeSignal = () => ({
   signalId: "signal-1",
   market: "Higher education media teams",
@@ -599,5 +613,55 @@ describe("research bundle integrity", () => {
     expect(ResearchBundleSchema.safeParse({ ...makeBundle(), generatedAt: earlier }).success).toBe(
       false,
     );
+  });
+
+  it("rejects evidence retrieved after a signal was calculated", () => {
+    const bundle = makeBundle();
+    bundle.evidence.push(makeAdditionalEvidence("evidence-2", "2026-08-29T12:30:00Z"));
+    const signal = first(bundle.marketSignals);
+    signal.evidenceIds = ["evidence-2"];
+    first(signal.claims.observed).evidenceIds = ["evidence-2"];
+    bundle.generatedAt = "2026-08-29T13:00:00Z";
+
+    const result = ResearchBundleSchema.safeParse(bundle);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({
+          path: ["marketSignals", 0, "evidenceIds", 0],
+          message: "signal evidence evidence-2 was retrieved after the signal was calculated",
+        }),
+      );
+    }
+  });
+
+  it("rejects evidence retrieved after an opportunity was generated", () => {
+    const bundle = makeBundle();
+    bundle.evidence.push(makeAdditionalEvidence("evidence-2", "2026-08-29T12:30:00Z"));
+    first(bundle.opportunities).evidenceIds.push("evidence-2");
+    bundle.generatedAt = "2026-08-29T13:00:00Z";
+
+    const result = ResearchBundleSchema.safeParse(bundle);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({
+          path: ["opportunities", 0, "evidenceIds", 1],
+          message: "opportunity evidence evidence-2 was retrieved after the dossier was generated",
+        }),
+      );
+    }
+  });
+
+  it("requires opportunity inputs to predate dossier generation", () => {
+    const lateSignal = makeBundle();
+    first(lateSignal.marketSignals).calculatedAt = "2026-08-29T13:00:00Z";
+    lateSignal.generatedAt = "2026-08-29T13:00:00Z";
+    expect(ResearchBundleSchema.safeParse(lateSignal).success).toBe(false);
+
+    const lateProfile = makeBundle();
+    lateProfile.founderProfile.confirmedAt = "2026-08-29T12:30:00Z";
+    lateProfile.generatedAt = "2026-08-29T12:30:00Z";
+    expect(ResearchBundleSchema.safeParse(lateProfile).success).toBe(false);
   });
 });

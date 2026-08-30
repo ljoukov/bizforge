@@ -1,6 +1,7 @@
 import { TrueForge, type TrueForgeApi, TrueForgeError } from "@truefoundry/trueforge-sdk";
 
 import {
+  AgentSessionSubmissionUnknownError,
   AgentTurnSubmissionUnknownError,
   type AgentActionResolution,
   type AgentRequiredAction,
@@ -43,12 +44,19 @@ export class TrueForgeAgentRuntime implements AgentRuntime {
     request: CreateAgentSessionRequest,
     signal: AbortSignal,
   ): Promise<AgentSessionReference> {
-    const { data: session } = await this.#client.sessions.create(
-      { agent: { name: request.agent.agentName } },
-      { abortSignal: signal, maxRetries: 0 },
-    );
+    try {
+      const { data: session } = await this.#client.sessions.create(
+        { agent: { name: request.agent.agentName } },
+        { abortSignal: signal, maxRetries: 0 },
+      );
 
-    return { sessionId: session.id };
+      return { sessionId: session.id };
+    } catch (error) {
+      if (isDefinitiveClientRejection(error)) {
+        throw error;
+      }
+      throw new AgentSessionSubmissionUnknownError(request.agent.agentName, { cause: error });
+    }
   }
 
   async startTurn(

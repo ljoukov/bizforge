@@ -122,6 +122,38 @@ export const ResearchBundleSchema = z
       }
     }
 
+    for (const [signalIndex, signal] of bundle.marketSignals.entries()) {
+      for (const [evidenceIndex, evidenceId] of signal.evidenceIds.entries()) {
+        const evidence = evidenceById.get(evidenceId);
+        if (
+          evidence !== undefined &&
+          Date.parse(evidence.provenance.retrievedAt) > Date.parse(signal.calculatedAt)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["marketSignals", signalIndex, "evidenceIds", evidenceIndex],
+            message: `signal evidence ${evidenceId} was retrieved after the signal was calculated`,
+          });
+        }
+      }
+    }
+
+    for (const [opportunityIndex, opportunity] of bundle.opportunities.entries()) {
+      for (const [evidenceIndex, evidenceId] of opportunity.evidenceIds.entries()) {
+        const evidence = evidenceById.get(evidenceId);
+        if (
+          evidence !== undefined &&
+          Date.parse(evidence.provenance.retrievedAt) > Date.parse(opportunity.generatedAt)
+        ) {
+          context.addIssue({
+            code: "custom",
+            path: ["opportunities", opportunityIndex, "evidenceIds", evidenceIndex],
+            message: `opportunity evidence ${evidenceId} was retrieved after the dossier was generated`,
+          });
+        }
+      }
+    }
+
     const allClaims = claimSetsInBundle(bundle).flatMap(flattenClaimSet);
     const claimIds = allClaims.map(({ claimId }) => claimId);
     if (!hasUniqueValues(claimIds)) {
@@ -155,7 +187,7 @@ export const ResearchBundleSchema = z
       });
     }
 
-    const knownSignalIds = new Set(signalIds);
+    const signalById = new Map(bundle.marketSignals.map((signal) => [signal.signalId, signal]));
     for (const [opportunityIndex, opportunity] of bundle.opportunities.entries()) {
       if (opportunity.founderProfileSnapshotId !== bundle.founderProfile.snapshotId) {
         context.addIssue({
@@ -165,12 +197,27 @@ export const ResearchBundleSchema = z
         });
       }
 
+      if (Date.parse(bundle.founderProfile.confirmedAt) > Date.parse(opportunity.generatedAt)) {
+        context.addIssue({
+          code: "custom",
+          path: ["opportunities", opportunityIndex, "generatedAt"],
+          message: "opportunity must be generated after the founder profile was confirmed",
+        });
+      }
+
       for (const [signalIndex, signalId] of opportunity.marketSignalIds.entries()) {
-        if (!knownSignalIds.has(signalId)) {
+        const signal = signalById.get(signalId);
+        if (signal === undefined) {
           context.addIssue({
             code: "custom",
             path: ["opportunities", opportunityIndex, "marketSignalIds", signalIndex],
             message: `unknown marketSignalId: ${signalId}`,
+          });
+        } else if (Date.parse(signal.calculatedAt) > Date.parse(opportunity.generatedAt)) {
+          context.addIssue({
+            code: "custom",
+            path: ["opportunities", opportunityIndex, "marketSignalIds", signalIndex],
+            message: `market signal ${signalId} was calculated after the dossier was generated`,
           });
         }
       }
