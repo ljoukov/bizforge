@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled and the BizForge MCP Step 1 tools listed below. Without them, drafts cannot be confirmed.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.5.0"
 ---
 
 # BizForge founder thesis editor
@@ -50,20 +50,14 @@ Before confirmation, verify these attached BizForge MCP tools:
 - `bizforge_get_consent` for evidence retention, version history, and Stage 2 use;
 - `bizforge_request_founder_data_deletion` and `bizforge_get_deletion_status` for deletion.
 
-Call `bizforge_get_data_status` first. If `isMock` or `ephemeral` is true, a real founder thesis
-must remain `session_only`: do not call `bizforge_save_confirmed_founder_profile`, set
-`confirmedAt`, or claim durable retention/deletion. Only an explicitly synthetic demo snapshot
-may exercise the mock validation/save path, and only after the user accepts that it is mock and
-ephemeral. Label it `mock=true`, show the exact returned `source` (`mcp_write` for a synthetic
-demo write and `mock_seed` only for a seeded fixture), and use `demoComplete` rather than real
-Step 1 completion. Call the save with `isSynthetic: true` and `acceptMockStorage: true` only
-after that acknowledgement. Its deterministic mock `ResearchBundle` is a demo handoff to Step
-3, never real Step 2 research. Keep `stage2HandoffEligible: false`; report any
-`mockStep2DemoEligible` value separately.
+Call `bizforge_get_data_status` first and require healthy persistent storage that accepts founder
+records. Keep backend, origin, and source fields out of normal founder-facing review and
+completion messages. If durable persistence is unavailable, do not save a confirmed profile,
+set `confirmedAt`, or claim durable retention or deletion.
 
 The TrueForge sandbox is temporary working space. It is never the durable snapshot, evidence,
-or consent store. If any required capability is absent or the data status is mock/ephemeral,
-keep real input as a clearly marked session draft and do not set `confirmedAt`.
+or consent store. If any required capability is absent or durable persistence is unavailable,
+fail closed before collecting further founder data and do not set `confirmedAt`.
 
 Load evidence and interview envelopes only with `bizforge_get_founder_setup_run`. Record draft
 edits with `bizforge_transition_founder_setup_run`, the current expected version, and an
@@ -196,20 +190,22 @@ Branch by the exact revoked scope:
 - Collection withdrawal stops future public-profile calls.
 - Stage 2 processing withdrawal stops new handoffs and active founder-fit processing without
   deleting records whose retention remains authorized.
-- Version-history withdrawal requests deletion of superseded versions and their derived indexes
-  while preserving the current authorized snapshot.
+- Version-history withdrawal records a new consent event; verify that superseded versions,
+  derived indexes, and replay payloads are minimized while the current authorized snapshot is
+  preserved.
 - Evidence or self-report retention withdrawal finds every dependent competency, snapshot,
   claim, research bundle, founder-fit derivative, index, and cache; invalidates those objects;
   blocks Stage 2; and requests deletion of the affected dependency closure.
 - Snapshot-retention withdrawal requests deletion of snapshots and all derivatives that cannot
   legally exist without them.
 
-Reserve the full-system inventory for an explicit full-deletion request. It covers the consent
-receipt, snapshots and version history, evidence artifacts, claims, research bundles,
-founder-fit derivatives, indexes/caches, TrueForge session transcripts, provider-side retained
-data, and backup-expiry obligations. Send the applicable scoped or full inventory to the
-`bizforge_request_founder_data_deletion` and inspect per-system status with
-`bizforge_get_deletion_status`. Report deletion as complete only after all
+Reserve the full-system inventory for an explicit deletion request for the current setup run. It
+covers that run's consent receipts, snapshots and version history, evidence artifacts, claims,
+research bundles, founder-fit derivatives, indexes/caches, TrueForge session transcripts,
+provider-side retained data, and backup-expiry obligations. The current deletion tool is
+setup-run scoped; never imply it removed another run for the same founder. Use
+`bizforge_request_founder_data_deletion` only after explicit confirmation and inspect per-system
+status with `bizforge_get_deletion_status`. Report deletion as complete only after all
 controllable copies are confirmed removed and any provider/backup expiry obligation is
 explicitly resolved.
 

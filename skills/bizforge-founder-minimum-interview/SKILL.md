@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, an interactive chat or Generative UI channel, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.3.0"
+  version: "0.5.0"
 ---
 
 # BizForge minimum founder interview
@@ -32,22 +32,20 @@ If consent is revoked or deletion is requested, stop the interview and hand off 
 
 ## Required runtime capabilities
 
-Call `bizforge_get_data_status` before asking for or retaining founder input. If `isMock` or
-`ephemeral` is true, keep real founder answers `session_only`: do not call
-`bizforge_put_evidence`, do not claim persistence, and do not make the draft confirmable. Only
-explicitly synthetic demo answers may exercise mock writes after the user accepts the
-mock/ephemeral limitation. Label them `mock=true` and show the exact returned `source`:
-`mcp_write` for a synthetic demo write and `mock_seed` only for a seeded fixture. For that
-accepted synthetic demo only, pass `isSynthetic: true` and `acceptMockStorage: true` on the
-applicable mock writes.
+The coordinator's greeting-only landing turn is pre-intake and requires no status call. After
+the founder supplies a competency, interest, answer, or profile URL, call
+`bizforge_get_data_status` before collecting or retaining founder input. Require healthy
+persistent storage that accepts founder records, and do not narrate backend, storage, origin, or
+MCP source fields in ordinary interview replies. If durable persistence is unavailable, fail
+closed before collecting or retaining answers.
 
 Use `bizforge_put_evidence` to record each retained answer as a canonical `user_input` evidence
 item and `bizforge_get_evidence` to verify that its returned ID resolves. Describe that record as
 durable only when `bizforge_get_data_status` says it is durable. The host or persistence boundary
 may expose authoritative TrueForge session and turn IDs. Use those values only when available;
 never ask the founder for them and never fabricate host metadata. If they are unavailable, use a
-schema-valid non-agent extraction method for the directly normalized self-report or keep the
-answer `session_only`. Never use a sandbox file path as a durable artifact reference.
+schema-valid non-agent extraction method for the directly normalized self-report or do not retain
+the answer. Never use a sandbox file path as a durable artifact reference.
 
 Use `bizforge_get_founder_setup_run` to load current evidence/interview state and
 retain the returned internal IDs without asking the founder for them. After each answered group,
@@ -66,13 +64,12 @@ Before durably persisting any answer—even on the interview-only branch—expla
 `retain_minimized_founder_self_report`,
 `retain_minimized_founder_snapshot`, optional `retain_founder_version_history`, and optional
 `use_confirmed_founder_snapshot_for_research`. The last scope controls Stage 2 use and is not a
-condition for completing a private Step 1 draft. If self-report retention is declined, keep the
-conversation `session_only`, do not call the evidence persistence API, and do not confirm a
-snapshot.
+condition for completing a private Step 1 draft. If self-report retention is declined, do not
+retain the answer, call the evidence persistence API, or confirm a snapshot.
 
-If durable persistence is unavailable or `bizforge_get_data_status` reports mock/ephemeral mode,
-the founder may continue conversationally, but label the result `session_only` and
-`readyForDraft: false`. Do not claim that it can be confirmed or used by Stage 2.
+If durable persistence is unavailable, do not collect founder answers. Briefly ask the founder
+to retry after the service is restored; do not claim that a draft can be confirmed or used by
+Stage 2.
 
 ## Build a gap map first
 
@@ -208,7 +205,7 @@ FounderInterviewPatch
   observedClaimIds[]
   contradictions[]
   unresolvedFields[]
-  persistenceStatus         durable | mock_ephemeral | session_only | failed
+  persistenceStatus         durable | failed
   readyForDraft
 ```
 
@@ -218,8 +215,8 @@ persistence failed.
 
 Apply every output and acceptance check in this skill, then call
 `bizforge_transition_founder_setup_run` for the compare-and-set transition to `DRAFT_REVIEW`.
-The successful transition records the untyped patch in the active backend but does not prove its
-shape is valid or make mock storage durable. A rendered chat summary is not an MCP handoff.
+The successful transition records the untyped patch but does not prove its shape is valid. A
+rendered chat summary is not an MCP handoff.
 
 Do not emit a schema-valid placeholder merely to make `readyForDraft` true.
 

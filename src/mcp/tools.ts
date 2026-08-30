@@ -1,24 +1,23 @@
 import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 
+import { ConfidenceBoundsSchema, DateRangeSchema } from "../domain/common.js";
 import { EvidenceItemSchema } from "../domain/evidence.js";
 import {
   ConfirmedFounderProfileSnapshotSchema,
   FounderProfileSnapshotSchema,
 } from "../domain/founder-profile.js";
-import { ConfidenceBoundsSchema, DateRangeSchema } from "../domain/common.js";
-import { MarketSignalSchema, type MarketSignal } from "../domain/market-signal.js";
+import { type MarketSignal, MarketSignalSchema } from "../domain/market-signal.js";
 import {
-  OpportunityDossierSchema,
   type OpportunityDossier,
+  OpportunityDossierSchema,
 } from "../domain/opportunity-dossier.js";
-import { ResearchBundleSchema, type ResearchBundle } from "../domain/research-bundle.js";
-import type { BizForgeDataStore } from "./data-store.js";
+import { type ResearchBundle, ResearchBundleSchema } from "../domain/research-bundle.js";
 import {
   ConsentRecordSchema,
   ConsentScopeSchema,
-  DataStoreStatusSchema,
   type DataStoreStatus,
+  DataStoreStatusSchema,
   DESTRUCTIVE_WRITE_ANNOTATIONS,
   DeletionRecordSchema,
   FounderSetupRunSchema,
@@ -29,6 +28,7 @@ import {
   type StoredResearchBundleRecord,
   WRITE_ANNOTATIONS,
 } from "./contracts.js";
+import type { BizForgeDataStore } from "./data-store.js";
 import { canonicalContentSha256 } from "./integrity.js";
 
 const EnvelopeBaseSchema = DataStoreStatusSchema.extend({
@@ -42,11 +42,28 @@ const EnvelopeBaseSchema = DataStoreStatusSchema.extend({
 const envelopeWithPayload = <T extends z.ZodType>(payload: T) =>
   EnvelopeBaseSchema.extend({ payload });
 
+const persistentResultWithPayload = <T extends z.ZodType>(payload: T) =>
+  z.object({ dataNotice: z.string().optional(), payload });
+
 const DataStatusPayloadSchema = DataStoreStatusSchema.extend({
   domainSchemaVersion: z.literal("1.0.0"),
   capabilities: z.object({
     step1Writes: z.boolean(),
     mockStep2Synthesis: z.boolean(),
+    step3ReadProjections: z.boolean(),
+    growthChartProjection: z.boolean(),
+    buyerEvidenceProjection: z.boolean(),
+    opportunityRerank: z.boolean(),
+  }),
+});
+
+const PersistentDataStatusPayloadSchema = z.object({
+  persistenceReady: z.boolean(),
+  founderDataWrites: z.boolean(),
+  domainSchemaVersion: z.literal("1.0.0"),
+  capabilities: z.object({
+    step1Writes: z.boolean(),
+    step2ResearchHandoff: z.boolean(),
     step3ReadProjections: z.boolean(),
     growthChartProjection: z.boolean(),
     buyerEvidenceProjection: z.boolean(),
@@ -74,10 +91,9 @@ const IneligibleGrowthProjectionSchema = z.object({
   inferenceStatus: z.literal("insufficient_growth_inputs"),
 });
 
-const EligibleGrowthProjectionSchema = z.object({
+const GrowthProjectionCoreSchema = z.object({
   signalId: z.string(),
   eligible: z.literal(true),
-  demoEligible: z.boolean(),
   market: z.string(),
   title: z.string(),
   metric: z.string(),
@@ -99,7 +115,15 @@ const EligibleGrowthProjectionSchema = z.object({
   methodology: z.string(),
   coverageNote: z.string(),
   evidenceIds: z.array(z.string()),
+});
+
+const EligibleGrowthProjectionSchema = GrowthProjectionCoreSchema.extend({
+  demoEligible: z.boolean(),
   inferenceStatus: z.enum(["synthetic_evidence_backed_inference", "evidence_backed_inference"]),
+});
+
+const PersistentEligibleGrowthProjectionSchema = GrowthProjectionCoreSchema.extend({
+  inferenceStatus: z.literal("evidence_backed_inference"),
 });
 
 const GrowthChartPayloadSchema = z.object({
@@ -108,6 +132,17 @@ const GrowthChartPayloadSchema = z.object({
     z.discriminatedUnion("eligible", [
       IneligibleGrowthProjectionSchema,
       EligibleGrowthProjectionSchema,
+    ]),
+  ),
+  chartPolicy: z.string(),
+});
+
+const PersistentGrowthChartPayloadSchema = z.object({
+  bundleId: z.string(),
+  charts: z.array(
+    z.discriminatedUnion("eligible", [
+      IneligibleGrowthProjectionSchema,
+      PersistentEligibleGrowthProjectionSchema,
     ]),
   ),
   chartPolicy: z.string(),
@@ -144,6 +179,11 @@ const SavedProfilePayloadSchema = z.object({
       founderProfileSnapshotId: z.string(),
     })
     .nullable(),
+});
+const PersistentSavedProfilePayloadSchema = z.object({
+  snapshotId: z.string(),
+  setupState: z.literal("CONFIRMED"),
+  stage2HandoffEligible: z.boolean(),
 });
 const DeletionPayloadSchema = z.object({ deletion: DeletionRecordSchema });
 
@@ -191,20 +231,40 @@ function failure(error: unknown) {
 }
 
 function createResponder(store: BizForgeDataStore) {
-  const success = (payload: unknown, options?: EnvelopeOptions) => {
-    const structuredContent = createResponseEnvelope(payload, store.getDataStatus(), options);
+  const exposeDiagnosticEnvelope = store.getDataStatus().isMock;
+  const success = (
+    payload: unknown,
+    options?: EnvelopeOptions,
+    persistentText = "Completed successfully.",
+  ) => {
+    const dataNotice = options?.isSynthetic === true ? syntheticWarning : undefined;
+    const structuredContent = exposeDiagnosticEnvelope
+      ? createResponseEnvelope(payload, store.getDataStatus(), options)
+      : { ...(dataNotice === undefined ? {} : { dataNotice }), payload };
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }],
+      content: [
+        {
+          type: "text" as const,
+          text: exposeDiagnosticEnvelope
+            ? JSON.stringify(structuredContent)
+            : [dataNotice, persistentText].filter(Boolean).join(" "),
+        },
+      ],
       structuredContent,
     };
   };
   const safelyWithOrigin = async (
     operation: () => unknown,
     options: EnvelopeOptions | (() => EnvelopeOptions),
+    persistentText?: string | (() => string),
   ) => {
     try {
       const payload = await operation();
-      return success(payload, typeof options === "function" ? options() : options);
+      return success(
+        payload,
+        typeof options === "function" ? options() : options,
+        typeof persistentText === "function" ? persistentText() : persistentText,
+      );
     } catch (error) {
       return failure(error);
     }
@@ -246,6 +306,15 @@ function assertWritePolicy(
   }
 }
 
+function booleanControl(input: object, key: "isSynthetic" | "acceptMockStorage"): boolean {
+  return (input as Record<string, unknown>)[key] === true;
+}
+
+function optionalStringControl(input: object, key: "founderId" | "setupRunId"): string | undefined {
+  const value = (input as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : undefined;
+}
+
 const BundleLocatorSchema = z.object({
   bundleId: z.string().min(1).optional(),
   bundleVersion: z.number().int().positive().optional(),
@@ -276,7 +345,7 @@ function findOpportunity(bundle: ResearchBundle, opportunityId: string): Opportu
   return opportunity;
 }
 
-function projectGrowth(signal: MarketSignal, isSynthetic: boolean) {
+function projectGrowth(signal: MarketSignal, isSynthetic: boolean, exposeDataMode: boolean) {
   const { measurement } = signal;
   const eligible =
     measurement.direction === "rising" &&
@@ -296,10 +365,9 @@ function projectGrowth(signal: MarketSignal, isSynthetic: boolean) {
       inferenceStatus: "insufficient_growth_inputs" as const,
     };
   }
-  return {
+  const projection = {
     signalId: signal.signalId,
     eligible: true as const,
-    demoEligible: isSynthetic,
     market: signal.market,
     title: signal.name,
     metric: measurement.metric,
@@ -320,81 +388,128 @@ function projectGrowth(signal: MarketSignal, isSynthetic: boolean) {
     methodology: measurement.methodology,
     coverageNote: measurement.coverageNote,
     evidenceIds: signal.evidenceIds,
-    inferenceStatus: isSynthetic
-      ? ("synthetic_evidence_backed_inference" as const)
-      : ("evidence_backed_inference" as const),
+    inferenceStatus: "evidence_backed_inference" as const,
   };
+  return exposeDataMode
+    ? {
+        ...projection,
+        demoEligible: isSynthetic,
+        inferenceStatus: isSynthetic
+          ? ("synthetic_evidence_backed_inference" as const)
+          : projection.inferenceStatus,
+      }
+    : projection;
 }
 
 export function registerBizForgeTools(server: McpServer, store: BizForgeDataStore): void {
   const { safelyWithOrigin, success } = createResponder(store);
+  const mockMode = store.getDataStatus().isMock;
+  const responseWithPayload = <T extends z.ZodType>(payload: T) =>
+    mockMode ? envelopeWithPayload(payload) : persistentResultWithPayload(payload);
   server.registerTool(
     "bizforge_get_data_status",
     {
       title: "Get BizForge data status",
-      description: "Report mock/persistence mode and available projection capabilities.",
+      description: mockMode
+        ? "Report mock/persistence mode and available projection capabilities."
+        : "Check whether BizForge is ready for founder onboarding and downstream work.",
       inputSchema: z.object({}),
-      outputSchema: envelopeWithPayload(DataStatusPayloadSchema),
+      outputSchema: responseWithPayload(
+        mockMode ? DataStatusPayloadSchema : PersistentDataStatusPayloadSchema,
+      ),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async () => {
       const status = store.getDataStatus();
+      const capabilities = {
+        step1Writes: true,
+        step3ReadProjections: true,
+        growthChartProjection: true,
+        buyerEvidenceProjection: false,
+        opportunityRerank: false,
+      };
+      const persistenceReady =
+        status.persistenceStatus === "persistent" && !status.ephemeral && !status.isMock;
+      const founderDataWrites = persistenceReady && status.writePolicy.acceptsNonSyntheticWrites;
+      const payload = mockMode
+        ? {
+            ...status,
+            domainSchemaVersion: "1.0.0" as const,
+            capabilities: {
+              ...capabilities,
+              mockStep2Synthesis: true,
+            },
+          }
+        : {
+            persistenceReady,
+            founderDataWrites,
+            domainSchemaVersion: "1.0.0" as const,
+            capabilities: {
+              ...capabilities,
+              step2ResearchHandoff: founderDataWrites,
+            },
+          };
       return success(
-        {
-          ...status,
-          domainSchemaVersion: "1.0.0",
-          capabilities: {
-            step1Writes: true,
-            mockStep2Synthesis: status.isMock,
-            step3ReadProjections: true,
-            growthChartProjection: true,
-            buyerEvidenceProjection: false,
-            opportunityRerank: false,
-          },
-        },
+        payload,
         {
           isSynthetic: status.isMock,
           source: status.isMock ? "mock_seed" : "mcp_write",
           provenanceMode: status.isMock ? "synthetic_fixture" : "recorded_data",
         },
+        !persistenceReady || !founderDataWrites
+          ? "BizForge data status is available."
+          : "BizForge is ready for founder onboarding and durable retention.",
       );
     },
   );
 
+  const createSetupRunInputShape = {
+    clientRequestId: z
+      .uuid()
+      .optional()
+      .describe(
+        "Optional for legacy compatibility. New interactive onboarding must generate a fresh UUID internally, reuse it for exact retries after a lost response, and never request it from an end user.",
+      ),
+  };
+  const legacySetupRuntimeIdInputShape = {
+    founderId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns founder-*. Never request this ID from an end user.",
+      ),
+    setupRunId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns setup-*. Never request this ID from an end user.",
+      ),
+  };
   server.registerTool(
     "bizforge_create_founder_setup_run",
     {
       title: "Start founder setup with server-assigned runtime IDs",
       description:
         "Create a versioned Step 1 setup run. Keyed requests replay safely: for each new interactive onboarding, the calling application or agent should generate a fresh clientRequestId UUID internally and reuse it only for an exact retry; never ask the end user for this key. Legacy callers may omit clientRequestId, but unkeyed creation is not retry-safe when IDs are server assigned. founderId and setupRunId are internal runtime IDs: omit both for a new onboarding and never ask an end user to provide them.",
-      inputSchema: z.object({
-        clientRequestId: z
-          .uuid()
-          .optional()
-          .describe(
-            "Optional for legacy compatibility. New interactive onboarding must generate a fresh UUID internally, reuse it for exact retries after a lost response, and never request it from an end user.",
-          ),
-        founderId: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns founder-*. Never request this ID from an end user.",
-          ),
-        setupRunId: z
-          .string()
-          .min(1)
-          .optional()
-          .describe(
-            "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns setup-*. Never request this ID from an end user.",
-          ),
-        isSynthetic: IsSyntheticInputSchema,
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(SetupRunPayloadSchema),
+      inputSchema: mockMode
+        ? z.object({
+            ...createSetupRunInputShape,
+            ...legacySetupRuntimeIdInputShape,
+            isSynthetic: IsSyntheticInputSchema,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z.object(createSetupRunInputShape).strict(),
+      outputSchema: responseWithPayload(SetupRunPayloadSchema),
       annotations: WRITE_ANNOTATIONS,
     },
-    async ({ clientRequestId, founderId, setupRunId, isSynthetic, acceptMockStorage }) => {
+    async (input) => {
+      const { clientRequestId } = input;
+      const founderId = optionalStringControl(input, "founderId");
+      const setupRunId = optionalStringControl(input, "setupRunId");
+      const isSynthetic = booleanControl(input, "isSynthetic");
+      const acceptMockStorage = booleanControl(input, "acceptMockStorage");
       let record: ReturnType<BizForgeDataStore["createSetupRun"]> | undefined;
       return safelyWithOrigin(
         () => {
@@ -408,17 +523,30 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
           return { run: record.value };
         },
         () => (record === undefined ? { isSynthetic } : originOf(record)),
+        "Setup started.",
       );
     },
   );
 
+  const transitionSetupRunInputShape = {
+    setupRunId: z.string().min(1),
+    expectedVersion: z.number().int().positive(),
+    targetState: FounderSetupStateSchema,
+    idempotencyKey: z.string().min(1),
+    stateData: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        "Complete replacement for current stateData. For incremental interview checkpoints, merge the latest run.stateData with new answers before calling this tool.",
+      ),
+  };
   server.registerTool(
     "bizforge_get_founder_setup_run",
     {
       title: "Get founder setup run",
       description: "Read the current version and state of a Step 1 setup run.",
       inputSchema: z.object({ setupRunId: z.string().min(1) }),
-      outputSchema: envelopeWithPayload(SetupRunPayloadSchema),
+      outputSchema: responseWithPayload(SetupRunPayloadSchema),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ setupRunId }) => {
@@ -434,23 +562,19 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Transition founder setup run",
       description:
         "Compare-and-set a setup state with an idempotency key. INTERVIEW may transition to INTERVIEW for incremental checkpoints. Supplied stateData replaces the prior object, so read and merge the current stateData before writing a checkpoint.",
-      inputSchema: z.object({
-        setupRunId: z.string().min(1),
-        expectedVersion: z.number().int().positive(),
-        targetState: FounderSetupStateSchema,
-        idempotencyKey: z.string().min(1),
-        stateData: z
-          .record(z.string(), z.unknown())
-          .optional()
-          .describe(
-            "Complete replacement for current stateData. For incremental interview checkpoints, merge the latest run.stateData with new answers before calling this tool.",
-          ),
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(TransitionPayloadSchema),
+      inputSchema: mockMode
+        ? z.object({
+            ...transitionSetupRunInputShape,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z.object(transitionSetupRunInputShape).strict(),
+      outputSchema: responseWithPayload(TransitionPayloadSchema),
       annotations: IDEMPOTENT_WRITE_ANNOTATIONS,
     },
-    async ({ acceptMockStorage, ...input }) => {
+    async (rawInput) => {
+      const acceptMockStorage = booleanControl(rawInput, "acceptMockStorage");
+      const { setupRunId, expectedVersion, targetState, idempotencyKey, stateData } = rawInput;
+      const input = { setupRunId, expectedVersion, targetState, idempotencyKey, stateData };
       const before = store.getSetupRun(input.setupRunId);
       return safelyWithOrigin(
         () => {
@@ -473,14 +597,18 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     {
       title: "Record founder consent",
       description: "Persist an immutable, separately scoped consent event.",
-      inputSchema: z.object({
-        consent: ConsentRecordSchema,
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(ConsentPayloadSchema),
+      inputSchema: mockMode
+        ? z.object({
+            consent: ConsentRecordSchema,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z.object({ consent: ConsentRecordSchema }).strict(),
+      outputSchema: responseWithPayload(ConsentPayloadSchema),
       annotations: IDEMPOTENT_WRITE_ANNOTATIONS,
     },
-    async ({ consent, acceptMockStorage }) => {
+    async (input) => {
+      const { consent } = input;
+      const acceptMockStorage = booleanControl(input, "acceptMockStorage");
       let record: ReturnType<BizForgeDataStore["recordConsent"]> | undefined;
       return safelyWithOrigin(
         () => {
@@ -502,7 +630,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
         setupRunId: z.string().min(1),
         scope: ConsentScopeSchema.optional(),
       }),
-      outputSchema: envelopeWithPayload(ConsentListPayloadSchema),
+      outputSchema: responseWithPayload(ConsentListPayloadSchema),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ setupRunId, scope }) =>
@@ -519,17 +647,27 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_put_evidence",
     {
       title: "Put canonical evidence",
-      description: "Store a canonical evidence item in the active storage adapter.",
-      inputSchema: z.object({
-        setupRunId: z.string().min(1),
-        evidence: EvidenceItemSchema,
-        isSynthetic: IsSyntheticInputSchema,
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(z.object({ evidence: EvidenceItemSchema })),
+      description: "Store a canonical evidence item.",
+      inputSchema: mockMode
+        ? z.object({
+            setupRunId: z.string().min(1),
+            evidence: EvidenceItemSchema,
+            isSynthetic: IsSyntheticInputSchema,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z
+            .object({
+              setupRunId: z.string().min(1),
+              evidence: EvidenceItemSchema,
+            })
+            .strict(),
+      outputSchema: responseWithPayload(z.object({ evidence: EvidenceItemSchema })),
       annotations: IDEMPOTENT_WRITE_ANNOTATIONS,
     },
-    async ({ setupRunId, evidence, isSynthetic, acceptMockStorage }) => {
+    async (input) => {
+      const { setupRunId, evidence } = input;
+      const isSynthetic = booleanControl(input, "isSynthetic");
+      const acceptMockStorage = booleanControl(input, "acceptMockStorage");
       let record: ReturnType<BizForgeDataStore["putEvidence"]> | undefined;
       return safelyWithOrigin(
         () => {
@@ -548,7 +686,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Get canonical evidence",
       description: "Read a minimized evidence item by ID without exposing provider payloads.",
       inputSchema: z.object({ evidenceId: z.string().min(1) }),
-      outputSchema: envelopeWithPayload(z.object({ evidence: EvidenceItemSchema })),
+      outputSchema: responseWithPayload(z.object({ evidence: EvidenceItemSchema })),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ evidenceId }) => {
@@ -564,7 +702,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Validate founder profile snapshot",
       description: "Validate a draft or confirmed snapshot using the pinned canonical schema.",
       inputSchema: z.object({ snapshot: z.unknown(), confirmationLevel: z.boolean() }),
-      outputSchema: envelopeWithPayload(ValidationPayloadSchema),
+      outputSchema: responseWithPayload(ValidationPayloadSchema),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ snapshot, confirmationLevel }) => {
@@ -587,21 +725,44 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_save_confirmed_founder_profile",
     {
       title: "Save confirmed founder profile",
-      description:
-        "Validate and immutably publish a founder snapshot; mock adapters may synthesize clearly labeled demo Step 2 data.",
-      inputSchema: z.object({
-        setupRunId: z.string().min(1),
-        expectedVersion: z.number().int().positive(),
-        idempotencyKey: z.string().min(1),
-        profile: ConfirmedFounderProfileSnapshotSchema,
-        isSynthetic: IsSyntheticInputSchema,
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(SavedProfilePayloadSchema),
+      description: mockMode
+        ? "Validate and immutably publish a founder snapshot; mock adapters may synthesize clearly labeled demo Step 2 data."
+        : "Validate and immutably publish a confirmed founder snapshot for downstream work.",
+      inputSchema: mockMode
+        ? z.object({
+            setupRunId: z.string().min(1),
+            expectedVersion: z.number().int().positive(),
+            idempotencyKey: z.string().min(1),
+            profile: ConfirmedFounderProfileSnapshotSchema,
+            isSynthetic: IsSyntheticInputSchema,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z
+            .object({
+              setupRunId: z.string().min(1),
+              expectedVersion: z.number().int().positive(),
+              idempotencyKey: z.string().min(1),
+              profile: ConfirmedFounderProfileSnapshotSchema,
+            })
+            .strict(),
+      outputSchema: responseWithPayload(
+        mockMode ? SavedProfilePayloadSchema : PersistentSavedProfilePayloadSchema,
+      ),
       annotations: IDEMPOTENT_WRITE_ANNOTATIONS,
     },
-    async ({ acceptMockStorage, ...input }) => {
+    async (rawInput) => {
+      const acceptMockStorage = booleanControl(rawInput, "acceptMockStorage");
+      const isSynthetic = booleanControl(rawInput, "isSynthetic");
+      const { setupRunId, expectedVersion, idempotencyKey, profile } = rawInput;
+      const input = { setupRunId, expectedVersion, idempotencyKey, profile, isSynthetic };
       let profileOrigin: RecordOrigin | undefined;
+      let persistentConfirmation:
+        | {
+            snapshotId: string;
+            setupState: "CONFIRMED";
+            stage2HandoffEligible: boolean;
+          }
+        | undefined;
       return safelyWithOrigin(
         () => {
           assertWritePolicy(store, acceptMockStorage, input.isSynthetic);
@@ -610,26 +771,40 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
           const generated = result.mockStep2DemoEligible
             ? store.getLatestResearchBundle(input.profile.founderId)
             : undefined;
-          return {
-            profile: result.profile.value,
-            run: result.run,
-            replayed: result.replayed,
+          if (result.run.state !== "CONFIRMED") {
+            throw new Error("Confirmed profile save returned an invalid setup state");
+          }
+          persistentConfirmation = {
+            snapshotId: result.profile.value.snapshotId,
+            setupState: result.run.state,
             stage2HandoffEligible: result.stage2HandoffEligible,
-            mockStep2DemoEligible: result.mockStep2DemoEligible,
-            mockStep2Bundle:
-              generated === undefined
-                ? null
-                : {
-                    bundleId: generated.value.bundleId,
-                    bundleVersion: generated.value.bundleVersion,
-                    founderProfileSnapshotId: generated.value.founderProfile.snapshotId,
-                  },
           };
+          return mockMode
+            ? {
+                profile: result.profile.value,
+                run: result.run,
+                replayed: result.replayed,
+                stage2HandoffEligible: result.stage2HandoffEligible,
+                mockStep2DemoEligible: result.mockStep2DemoEligible,
+                mockStep2Bundle:
+                  generated === undefined
+                    ? null
+                    : {
+                        bundleId: generated.value.bundleId,
+                        bundleVersion: generated.value.bundleVersion,
+                        founderProfileSnapshotId: generated.value.founderProfile.snapshotId,
+                      },
+              }
+            : persistentConfirmation;
         },
         () =>
           profileOrigin === undefined
             ? { isSynthetic: input.isSynthetic }
             : originOf(profileOrigin),
+        () =>
+          persistentConfirmation === undefined
+            ? "Founder profile confirmed."
+            : `Founder profile confirmed. Snapshot ${persistentConfirmation.snapshotId}; setup ${persistentConfirmation.setupState}; downstream research ${persistentConfirmation.stage2HandoffEligible ? "eligible" : "not enabled"}.`,
       );
     },
   );
@@ -640,7 +815,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Get confirmed founder profile",
       description: "Read an immutable confirmed founder snapshot by ID.",
       inputSchema: z.object({ snapshotId: z.string().min(1) }),
-      outputSchema: envelopeWithPayload(
+      outputSchema: responseWithPayload(
         z.object({ profile: ConfirmedFounderProfileSnapshotSchema }),
       ),
       annotations: READ_ONLY_ANNOTATIONS,
@@ -656,20 +831,32 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
   server.registerTool(
     "bizforge_request_founder_data_deletion",
     {
-      title: "Request founder data deletion",
+      title: "Request setup-run data deletion",
       description:
-        "Delete controllable records and report external/provider/backup obligations truthfully.",
-      inputSchema: z.object({
-        setupRunId: z.string().min(1),
-        founderId: z.string().min(1),
-        reason: z.string().min(1),
-        idempotencyKey: z.string().min(1),
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(DeletionPayloadSchema),
+        "Delete controllable records associated with one setup run and report remaining external, provider, or backup obligations truthfully.",
+      inputSchema: mockMode
+        ? z.object({
+            setupRunId: z.string().min(1),
+            founderId: z.string().min(1),
+            reason: z.string().min(1),
+            idempotencyKey: z.string().min(1),
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z
+            .object({
+              setupRunId: z.string().min(1),
+              founderId: z.string().min(1),
+              reason: z.string().min(1),
+              idempotencyKey: z.string().min(1),
+            })
+            .strict(),
+      outputSchema: responseWithPayload(DeletionPayloadSchema),
       annotations: DESTRUCTIVE_WRITE_ANNOTATIONS,
     },
-    async ({ acceptMockStorage, ...input }) => {
+    async (rawInput) => {
+      const acceptMockStorage = booleanControl(rawInput, "acceptMockStorage");
+      const { setupRunId, founderId, reason, idempotencyKey } = rawInput;
+      const input = { setupRunId, founderId, reason, idempotencyKey };
       let record: ReturnType<BizForgeDataStore["requestDeletion"]> | undefined;
       return safelyWithOrigin(
         () => {
@@ -688,7 +875,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Get deletion status",
       description: "Read per-system deletion status without collapsing unresolved obligations.",
       inputSchema: z.object({ deletionRequestId: z.string().min(1) }),
-      outputSchema: envelopeWithPayload(DeletionPayloadSchema),
+      outputSchema: responseWithPayload(DeletionPayloadSchema),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ deletionRequestId }) => {
@@ -703,16 +890,21 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_save_research_bundle",
     {
       title: "Save research bundle",
-      description: "Validate and save a Step 2 research bundle in the active storage adapter.",
-      inputSchema: z.object({
-        bundle: ResearchBundleSchema,
-        isSynthetic: IsSyntheticInputSchema,
-        acceptMockStorage: AcceptMockStorageSchema,
-      }),
-      outputSchema: envelopeWithPayload(z.object({ bundle: ResearchBundleSchema })),
+      description: "Validate and save a Step 2 research bundle.",
+      inputSchema: mockMode
+        ? z.object({
+            bundle: ResearchBundleSchema,
+            isSynthetic: IsSyntheticInputSchema,
+            acceptMockStorage: AcceptMockStorageSchema,
+          })
+        : z.object({ bundle: ResearchBundleSchema }).strict(),
+      outputSchema: responseWithPayload(z.object({ bundle: ResearchBundleSchema })),
       annotations: IDEMPOTENT_WRITE_ANNOTATIONS,
     },
-    async ({ bundle, isSynthetic, acceptMockStorage }) => {
+    async (input) => {
+      const { bundle } = input;
+      const isSynthetic = booleanControl(input, "isSynthetic");
+      const acceptMockStorage = booleanControl(input, "acceptMockStorage");
       let record: ReturnType<BizForgeDataStore["saveResearchBundle"]> | undefined;
       return safelyWithOrigin(
         () => {
@@ -734,7 +926,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
         bundleId: z.string().min(1),
         bundleVersion: z.number().int().positive().optional(),
       }),
-      outputSchema: envelopeWithPayload(z.object({ bundle: ResearchBundleSchema })),
+      outputSchema: responseWithPayload(z.object({ bundle: ResearchBundleSchema })),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ bundleId, bundleVersion }) => {
@@ -758,7 +950,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
           .optional()
           .describe("Exact founder ID. Omit this field for the global latest bundle."),
       }),
-      outputSchema: envelopeWithPayload(z.object({ bundle: ResearchBundleSchema })),
+      outputSchema: responseWithPayload(z.object({ bundle: ResearchBundleSchema })),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ founderId }) => {
@@ -775,7 +967,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "List opportunity projections",
       description: "List evidence-aware Step 3 opportunity summaries from a research bundle.",
       inputSchema: BundleLocatorSchema,
-      outputSchema: envelopeWithPayload(
+      outputSchema: responseWithPayload(
         z.object({
           bundleId: z.string(),
           bundleVersion: z.number().int().positive(),
@@ -816,7 +1008,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Get opportunity projection",
       description: "Read one full opportunity with an explicit buyer-evidence limitation.",
       inputSchema: BundleLocatorSchema.extend({ opportunityId: z.string().min(1) }),
-      outputSchema: envelopeWithPayload(
+      outputSchema: responseWithPayload(
         z.object({
           bundleId: z.string(),
           opportunity: OpportunityDossierSchema,
@@ -850,7 +1042,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       title: "Get market signals",
       description: "Read market signals and their evidence IDs without inventing trend claims.",
       inputSchema: BundleLocatorSchema,
-      outputSchema: envelopeWithPayload(
+      outputSchema: responseWithPayload(
         z.object({
           bundleId: z.string(),
           bundleVersion: z.number().int().positive(),
@@ -882,7 +1074,9 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       description:
         "Project chart-ready growth only when both windows, values, changes, methodology, coverage, and evidence are present.",
       inputSchema: BundleLocatorSchema.extend({ signalId: z.string().min(1).optional() }),
-      outputSchema: envelopeWithPayload(GrowthChartPayloadSchema),
+      outputSchema: responseWithPayload(
+        mockMode ? GrowthChartPayloadSchema : PersistentGrowthChartPayloadSchema,
+      ),
       annotations: READ_ONLY_ANNOTATIONS,
     },
     async ({ signalId, ...locator }) => {
@@ -899,7 +1093,9 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
           }
           return {
             bundleId: record.value.bundleId,
-            charts: signals.map((signal) => projectGrowth(signal, record?.isSynthetic ?? false)),
+            charts: signals.map((signal) =>
+              projectGrowth(signal, record?.isSynthetic ?? false, mockMode),
+            ),
             chartPolicy:
               "Render numeric growth only for eligible projections and keep methodology, coverage, evidence IDs, and inference status visible.",
           };

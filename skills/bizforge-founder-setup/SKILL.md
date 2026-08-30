@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, all three BizForge founder subskills, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.3.0"
+  version: "0.5.0"
 ---
 
 # BizForge founder setup coordinator
@@ -41,22 +41,34 @@ exact tools:
   `bizforge_save_confirmed_founder_profile`, and `bizforge_get_confirmed_founder_profile`;
 - deletion: `bizforge_request_founder_data_deletion` and `bizforge_get_deletion_status`.
 
-Call `bizforge_get_data_status` before collecting any founder data. Inspect `dataMode`,
-`storageBackend`, `isMock`, `ephemeral`, fixture/schema versions, and warnings. If `isMock` or
-`ephemeral` is true, never collect a real public profile, never persist real founder input, and
-never claim durable confirmation or deletion. Keep real input `session_only`. Only an explicitly
-synthetic demo founder may exercise the mock write/save path, and only after the user accepts
-that it is mock and ephemeral. Label every such artifact `mock=true` and show the exact returned
-`source`: `mcp_write` for a synthetic demo write and `mock_seed` only for a seeded fixture.
-For that accepted demo only, pass `isSynthetic: true` and the required
-`acceptMockStorage: true` acknowledgement on mock writes. The acknowledgement does not make the
-store durable or authorize real founder data.
+Call `bizforge_get_data_status` before collecting any founder data and require healthy,
+persistent storage that accepts founder records. Treat this as internal infrastructure: in
+ordinary healthy onboarding replies, do not narrate the backend, storage mode, record origin,
+MCP source fields, or implementation names. Surface infrastructure only when degraded, when a
+write fails, or when the founder explicitly asks. If durable persistence is unavailable, fail
+closed before collecting profile data and ask the founder to try again after the service is
+restored.
 
 Verify the public-profile connector only if the founder requests profile enrichment and the MCP
-reports a durable non-mock mode. Never use the temporary TrueForge sandbox as the durable store
+reports healthy persistent storage. Never use the temporary TrueForge sandbox as the durable store
 and never expose infrastructure requirements as founder questions.
 
 ## Conversation bootstrap and internal IDs
+
+### Greeting-only landing turn
+
+When the opening user message is only a greeting or social opener—such as `hello`, `hi`, `hey`,
+or `good morning`—do not start a setup run and do not call MCP, connector, or sandbox tools. Do
+not discuss storage mode, consent, schemas, IDs, or the interview yet. Reply in no more than two
+short sentences, using this wording or a very close equivalent:
+
+> Hi — I’ll help match your skills and interests to evidence-backed business opportunities. Tell
+> me your main competencies or interests, or paste your LinkedIn profile URL.
+
+This is a pre-intake landing turn, not founder data collection. If the message contains both a
+greeting and substantive founder input or a profile URL, skip the landing response and process
+the supplied input normally. After the founder supplies a competency, interest, or profile URL,
+continue with the capability/status and consent gates below.
 
 A new setup may begin with one short, non-sensitive seed such as `workflow and operations
 automation`. Treat that phrase as a candidate competency or area of interest, not as a complete
@@ -77,15 +89,9 @@ collision-resistant UUID in the sandbox and never derive it from the founder's n
 TrueForge session and turn IDs are different: use them only when the host exposes them; never ask
 the founder for host metadata or fabricate it.
 
-In mock/ephemeral mode, the first response may need one concise storage-and-consent gate before
-anything is retained. Ask that gate in founder language, not infrastructure language. After it
-is accepted, create the run internally and continue the interview. Do not expose tool argument
-names, schema requirements, or generated IDs as questions.
-
-If durable capabilities are missing or the MCP reports mock/ephemeral mode, permit a clearly
-labelled `session_only` interview draft
-but do not call an external profile source, claim durable retention, set `confirmedAt`, or hand
-anything to Stage 2.
+If durable capabilities are missing, do not collect founder answers, call an external profile
+source, set `confirmedAt`, or hand anything to Stage 2. Do not expose tool argument names,
+schema requirements, or generated IDs as questions.
 
 The BizForge MCP tool schemas are authoritative. Consent is stored as one immutable
 `ConsentRecord` per scope. `FounderEvidenceDraft` and `FounderInterviewPatch` remain conceptual
@@ -113,7 +119,8 @@ DRAFT_REVIEW
   -> DRAFT_REVIEW          after edits
   -> CONFIRMED             after exact-version approval and confirmation-level validation
 CONFIRMED
-  -> REVISION_DRAFT        when the founder requests a correction; prior snapshot stays immutable
+  -> REVISION_DRAFT        when the founder requests a correction; retain the prior snapshot only
+                            while version-history consent is active
 REVISION_DRAFT
   -> REVISION_DRAFT        after edits
   -> CONFIRMED             after a new exact version is approved and validated
@@ -146,7 +153,7 @@ records.
    validate the exact final artifact with `bizforge_validate_founder_profile_snapshot`, save it
    with `bizforge_save_confirmed_founder_profile`, and use the updated `CONFIRMED` run returned by
    that atomic save. Do not issue a second state transition. For real founder data, these
-   confirmation/save steps require a durable non-mock data status.
+   confirmation/save steps require healthy persistent storage.
 4. `bizforge_save_confirmed_founder_profile` creates the canonical immutable Step 1 output that
    Step 2 and Step 3 share through the BizForge MCP. Saving that output is not itself a Stage 2
    handoff. Set `stage2HandoffEligible` only when
@@ -168,21 +175,23 @@ Deletion status must be one of `pending`, `pending_expiry`, `completed`, `failed
 - Say why a public source or question is needed before collecting it.
 - Show normalized numeric values before saving them.
 - Preserve “not sure” and “prefer not to answer” as unresolved rather than guessing.
-- Make current state, persistence status, and the next required action visible.
+- Make current onboarding state and the next required action visible. Show persistence details
+  only when degraded, failed, or explicitly requested.
 - Do not begin opportunity research or market scoring in Step 1.
 
 ## Completion contract
 
 For real founder data, Step 1 is complete only when all of the following are true and
-`bizforge_get_data_status` reports a durable non-mock backend:
+`bizforge_get_data_status` reports healthy persistent storage:
 
 - the exact displayed thesis version was explicitly confirmed;
 - canonical and confirmation-level validators passed;
 - `bizforge_save_confirmed_founder_profile` returned the immutable snapshot and every referenced
   item resolves with `bizforge_get_evidence`;
 - every retained competency is evidence-backed;
-- the coordinator can return the persisted `snapshotId` and `setupRunId` without exposing raw
-  personal data.
+- the coordinator can return the persisted `snapshotId` without exposing raw personal data;
+- `founderId`, `setupRunId`, consent/evidence IDs, and idempotency keys remain internal even at
+  completion unless the founder explicitly requests technical diagnostics.
 
 Report `stage2HandoffEligible` separately. It is true only when
 `use_confirmed_founder_snapshot_for_research` is active and the canonical save succeeded;
@@ -191,9 +200,6 @@ otherwise Step 1 may still be complete while Stage 2 remains consent-blocked. Re
 missing completion condition, return the current nonterminal state and blockers. Never report
 Step 1 complete from chat text or sandbox files alone.
 
-An explicitly accepted synthetic demo may return `demoComplete: true`, but must never be
-represented as real or durable Step 1 completion. Saving the demo snapshot deterministically
-creates a validated mock `ResearchBundle` tied to that exact snapshot; expose its bundle ID and
-version as a demo handoff to Step 3, never as real Step 2 research. Keep
-`stage2HandoffEligible: false`; the response may separately report
-`mockStep2DemoEligible: true` when the synthetic, consented demo bundle is available.
+For a healthy persistent completion, keep the founder-facing result concise: show the confirmed
+`snapshotId`, setup state, and downstream research eligibility. Do not include infrastructure,
+record-origin fields, `founderId`, or `setupRunId` in that normal result.

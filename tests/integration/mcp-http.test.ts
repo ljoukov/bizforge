@@ -1,12 +1,18 @@
+import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { DataStoreStatus } from "../../src/mcp/contracts.js";
-import { type BizForgeDataStore, InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
-import { createBizForgeHttpServer } from "../../src/mcp/http-server.js";
-import { createSeededBizForgeDataStore } from "../../src/mcp/server.js";
+import type { BizForgeDataStore } from "../../src/mcp/data-store.js";
+import { createBizForgeHttpServer, listenForBizForgeMcp } from "../../src/mcp/http-server.js";
+import {
+  createConfiguredBizForgeDataStore,
+  createSeededBizForgeDataStore,
+} from "../../src/mcp/server.js";
+import { SqliteBizForgeDataStore } from "../../src/mcp/sqlite-data-store.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -18,6 +24,7 @@ const createRequestIds = {
   explicitReplay: "00000000-0000-4000-8000-000000000005",
   endToEnd: "00000000-0000-4000-8000-000000000006",
   persistent: "00000000-0000-4000-8000-000000000007",
+  persistentSynthetic: "00000000-0000-4000-8000-000000000008",
 } as const;
 
 function asObject(value: unknown): JsonObject {
@@ -29,25 +36,6 @@ function asObject(value: unknown): JsonObject {
 
 function payloadOf(result: { structuredContent?: unknown }): JsonObject {
   return asObject(asObject(result.structuredContent).payload);
-}
-
-class PersistentTestDataStore extends InMemoryBizForgeDataStore {
-  override getDataStatus(): DataStoreStatus {
-    return {
-      dataMode: "persistent",
-      storageMode: "persistent",
-      storageBackend: "sqlite",
-      persistenceStatus: "persistent",
-      isMock: false,
-      ephemeral: false,
-      writePolicy: {
-        requiresExplicitMockAcceptance: false,
-        acceptsNonSyntheticWrites: true,
-      },
-      fixtureVersion: "none",
-      warnings: [],
-    };
-  }
 }
 
 async function startServer(store: BizForgeDataStore = createSeededBizForgeDataStore()) {
@@ -552,6 +540,29 @@ describe("BizForge MCP HTTP server", () => {
         }),
       ),
     ).toMatchObject({ buyerEvidenceStatus: "unlinked/hypothesis_only" });
+
+    for (const [name, toolArguments, message] of [
+      [
+        "bizforge_list_opportunities",
+        { bundleId: "missing-bundle", bundleVersion: 1 },
+        "No matching research bundle",
+      ],
+      [
+        "bizforge_get_opportunity",
+        { bundleId, bundleVersion, opportunityId: "missing-opportunity" },
+        "Opportunity missing-opportunity was not found",
+      ],
+      [
+        "bizforge_get_latest_research_bundle",
+        { founderId: "missing-founder" },
+        "No matching research bundle",
+      ],
+    ] as const) {
+      const missingResult = await client.callTool({ name, arguments: toolArguments });
+      expect(missingResult.isError).toBe(true);
+      expect(JSON.stringify(missingResult.content)).toContain(message);
+    }
+
     const signals = payloadOf(
       await client.callTool({
         name: "bizforge_get_market_signals",
@@ -635,6 +646,17 @@ describe("BizForge MCP HTTP server", () => {
     });
     expect(savedAgain.isError).not.toBe(true);
 
+    const evidenceResource = await client.readResource({
+      uri: `bizforge://evidence/${evidenceId}`,
+    });
+    expect(evidenceResource.contents[0]).toMatchObject({ mimeType: "application/json" });
+    const evidenceContent = evidenceResource.contents[0];
+    if (evidenceContent === undefined || !("text" in evidenceContent)) {
+      throw new Error("Expected text evidence resource content");
+    }
+    expect(JSON.parse(evidenceContent.text)).toMatchObject({
+      payload: { evidence: { evidenceId } },
+    });
     const founderResource = await client.readResource({
       uri: `bizforge://founder-snapshots/${snapshotId}`,
     });
@@ -650,6 +672,9 @@ describe("BizForge MCP HTTP server", () => {
     await expect(
       client.readResource({ uri: "bizforge://founder-snapshots/missing" }),
     ).rejects.toThrow(/not found/);
+    await expect(client.readResource({ uri: "bizforge://evidence/missing" })).rejects.toThrow(
+      /not found/,
+    );
     await expect(
       client.readResource({
         uri: `bizforge://research-bundles/${bundleId}/versions/not-a-number`,
@@ -694,17 +719,81 @@ describe("BizForge MCP HTTP server", () => {
     ).toMatchObject({ deletion: { status: "pending_expiry" } });
   });
 
-  it("keeps the tool contract backend-neutral for a persistent adapter", async () => {
-    const { server, baseUrl } = await startServer(new PersistentTestDataStore());
+  it("persists the backend-neutral tool contract across a SQLite restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bizforge-mcp-http-"));
+    const databasePath = join(directory, "bizforge.sqlite");
+    const firstStore = new SqliteBizForgeDataStore(databasePath);
+    const { server, baseUrl } = await startServer(firstStore);
     const client = new Client({ name: "bizforge-persistent-test", version: "1.0.0" });
     const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
+    let clientClosed = false;
+    let serverClosed = false;
+    let restartedStore: SqliteBizForgeDataStore | undefined;
+    let restartedServer: ReturnType<typeof createBizForgeHttpServer> | undefined;
+    let restartedClient: Client | undefined;
+    let restartedClientClosed = false;
+    let restartedServerClosed = false;
     cleanup.push(async () => {
-      await client.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (!clientClosed) await client.close();
+      if (!serverClosed && server.listening) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+      if (!restartedClientClosed && restartedClient !== undefined) await restartedClient.close();
+      if (!restartedServerClosed && restartedServer?.listening === true) {
+        await new Promise<void>((resolve) => restartedServer?.close(() => resolve()));
+      }
+      firstStore.close();
+      restartedStore?.close();
+      await rm(directory, { recursive: true, force: true });
     });
     await client.connect(transport);
 
     const listed = await client.listTools();
+    for (const tool of listed.tools) {
+      const outputSchema = asObject(tool.outputSchema);
+      expect(Object.keys(asObject(outputSchema.properties))).toEqual(["dataNotice", "payload"]);
+      expect(outputSchema.required).toEqual(["payload"]);
+      expect(tool.description?.toLowerCase()).not.toMatch(
+        /mock|synthetic|demo|ephemeral|storage adapter|provenance/,
+      );
+    }
+    const persistentSaveTool = listed.tools.find(
+      ({ name }) => name === "bizforge_save_confirmed_founder_profile",
+    );
+    if (persistentSaveTool === undefined) throw new Error("missing profile save tool");
+    expect(JSON.stringify(persistentSaveTool.outputSchema)).not.toMatch(
+      /mockStep2|founderId|setupRunId|profile"|run"/,
+    );
+    const persistentStatusTool = listed.tools.find(
+      ({ name }) => name === "bizforge_get_data_status",
+    );
+    if (persistentStatusTool === undefined) throw new Error("missing data status tool");
+    expect(JSON.stringify(persistentStatusTool.outputSchema)).not.toMatch(
+      /isMock|storageBackend|storageMode|mockStep2|ephemeral|provenance|fixture|source/i,
+    );
+    const persistentCreateTool = listed.tools.find(
+      ({ name }) => name === "bizforge_create_founder_setup_run",
+    );
+    if (persistentCreateTool === undefined) throw new Error("missing setup creation tool");
+    expect(asObject(asObject(persistentCreateTool.inputSchema).properties)).not.toHaveProperty(
+      "founderId",
+    );
+    expect(asObject(asObject(persistentCreateTool.inputSchema).properties)).not.toHaveProperty(
+      "setupRunId",
+    );
+    const persistentGrowthTool = listed.tools.find(
+      ({ name }) => name === "bizforge_get_growth_chart_data",
+    );
+    if (persistentGrowthTool === undefined) throw new Error("missing growth chart tool");
+    expect(JSON.stringify(persistentGrowthTool.outputSchema)).not.toMatch(
+      /mock|synthetic|demo|ephemeral|fixture/i,
+    );
+    const deletionTool = listed.tools.find(
+      ({ name }) => name === "bizforge_request_founder_data_deletion",
+    );
+    if (deletionTool === undefined) throw new Error("missing setup-run deletion tool");
+    expect(deletionTool.title).toContain("setup-run");
+    expect(deletionTool.description).toContain("one setup run");
     for (const toolName of [
       "bizforge_create_founder_setup_run",
       "bizforge_transition_founder_setup_run",
@@ -718,11 +807,10 @@ describe("BizForge MCP HTTP server", () => {
       if (tool === undefined) throw new Error(`missing tool ${toolName}`);
       const inputSchema = asObject(tool.inputSchema);
       const properties = asObject(inputSchema.properties);
-      expect(asObject(properties.acceptMockStorage)).toMatchObject({
-        type: "boolean",
-        default: false,
-      });
-      expect(inputSchema.required as unknown[] | undefined).not.toContain("acceptMockStorage");
+      expect(properties).not.toHaveProperty("acceptMockStorage");
+      expect((inputSchema.required as unknown[] | undefined) ?? []).not.toContain(
+        "acceptMockStorage",
+      );
     }
     for (const toolName of [
       "bizforge_create_founder_setup_run",
@@ -734,51 +822,66 @@ describe("BizForge MCP HTTP server", () => {
       if (tool === undefined) throw new Error(`missing tool ${toolName}`);
       const inputSchema = asObject(tool.inputSchema);
       const properties = asObject(inputSchema.properties);
-      expect(asObject(properties.isSynthetic)).toMatchObject({ type: "boolean" });
-      expect(asObject(properties.isSynthetic)).not.toHaveProperty("const");
-      expect(asObject(properties.isSynthetic)).not.toHaveProperty("default");
-      expect(inputSchema.required as unknown[] | undefined).toContain("isSynthetic");
+      expect(properties).not.toHaveProperty("isSynthetic");
+      expect((inputSchema.required as unknown[] | undefined) ?? []).not.toContain("isSynthetic");
     }
 
     const status = await client.callTool({ name: "bizforge_get_data_status", arguments: {} });
-    expect(asObject(status.structuredContent)).toMatchObject({
-      dataMode: "persistent",
-      storageMode: "persistent",
-      storageBackend: "sqlite",
-      persistenceStatus: "persistent",
-      isMock: false,
-      ephemeral: false,
-      provenanceMode: "recorded_data",
-      writePolicy: {
-        requiresExplicitMockAcceptance: false,
-        acceptsNonSyntheticWrites: true,
+    expect(Object.keys(asObject(status.structuredContent))).toEqual(["payload"]);
+    expect(status.content).toEqual([
+      {
+        type: "text",
+        text: "BizForge is ready for founder onboarding and durable retention.",
+      },
+    ]);
+    expect(payloadOf(status)).toEqual({
+      persistenceReady: true,
+      founderDataWrites: true,
+      domainSchemaVersion: "1.0.0",
+      capabilities: {
+        step1Writes: true,
+        step2ResearchHandoff: true,
+        step3ReadProjections: true,
+        growthChartProjection: true,
+        buyerEvidenceProjection: false,
+        opportunityRerank: false,
       },
     });
-    expect(payloadOf(status)).toMatchObject({
-      capabilities: { mockStep2Synthesis: false },
-    });
+    expect(JSON.stringify(status.structuredContent)).not.toMatch(
+      /isMock|storageBackend|storageMode|mockStep2|ephemeral|provenance|fixture|source/i,
+    );
 
-    const founderId = "founder-persistent";
-    const setupRunId = "setup-persistent";
     const evidenceId = "evidence-persistent";
-    const snapshotId = "snapshot-persistent";
+    const proposedSnapshotId = "snapshot-persistent";
     const created = await client.callTool({
       name: "bizforge_create_founder_setup_run",
       arguments: {
         clientRequestId: createRequestIds.persistent,
-        founderId,
-        setupRunId,
-        isSynthetic: false,
       },
     });
     expect(created.isError).not.toBe(true);
-    expect(asObject(created.structuredContent)).toMatchObject({
-      storageBackend: "sqlite",
-      isMock: false,
-      ephemeral: false,
-      isSynthetic: false,
-      provenanceMode: "recorded_data",
+    expect(Object.keys(asObject(created.structuredContent))).toEqual(["payload"]);
+    const createdRun = asObject(payloadOf(created).run);
+    const founderId = String(createdRun.founderId);
+    const setupRunId = String(createdRun.setupRunId);
+    expect(founderId).toMatch(/^founder-/);
+    expect(setupRunId).toMatch(/^setup-/);
+    expect(createdRun).toMatchObject({ founderId, setupRunId, state: "CONSENT_PENDING" });
+    expect(created.content).toEqual([{ type: "text", text: "Setup started." }]);
+    expect(JSON.stringify(created.content)).not.toMatch(
+      /mock|synthetic|demo|ephemeral|storage|provenance|source/i,
+    );
+
+    const rejectedLegacyOriginFlag = await client.callTool({
+      name: "bizforge_create_founder_setup_run",
+      arguments: {
+        clientRequestId: createRequestIds.persistentSynthetic,
+        founderId: "founder-persistent-synthetic-check",
+        setupRunId: "setup-persistent-synthetic-check",
+        isSynthetic: true,
+      },
     });
+    expect(rejectedLegacyOriginFlag.isError).toBe(true);
 
     for (const [consentId, scope] of [
       ["consent-self-report-persistent", "retain_minimized_founder_self_report"],
@@ -801,7 +904,10 @@ describe("BizForge MCP HTTP server", () => {
         },
       });
       expect(result.isError).not.toBe(true);
-      expect(asObject(result.structuredContent).storageBackend).toBe("sqlite");
+      expect(Object.keys(asObject(result.structuredContent))).toEqual(["payload"]);
+      expect(JSON.stringify(result.content)).not.toMatch(
+        /mock|synthetic|demo|ephemeral|storage|provenance|source/i,
+      );
     }
 
     const evidence = {
@@ -817,7 +923,7 @@ describe("BizForge MCP HTTP server", () => {
         contentSha256: "b".repeat(64),
       },
       observedAt: "2026-08-01T12:00:00.000Z",
-      rawArtifactRef: "sqlite://evidence/persistent-founder-input",
+      rawArtifactRef: `bizforge://evidence/${evidenceId}`,
       locator: { jsonPointer: "/founder/competencies/0" },
       extraction: { method: "manual", version: "test-v1" },
       attributes: {},
@@ -825,13 +931,11 @@ describe("BizForge MCP HTTP server", () => {
     };
     const storedEvidence = await client.callTool({
       name: "bizforge_put_evidence",
-      arguments: { setupRunId, evidence, isSynthetic: false },
+      arguments: { setupRunId, evidence },
     });
     expect(storedEvidence.isError).not.toBe(true);
-    expect(asObject(storedEvidence.structuredContent)).toMatchObject({
-      storageBackend: "sqlite",
-      isSynthetic: false,
-    });
+    expect(Object.keys(asObject(storedEvidence.structuredContent))).toEqual(["payload"]);
+    expect(payloadOf(storedEvidence)).toMatchObject({ evidence: { evidenceId } });
 
     for (const [expectedVersion, targetState, idempotencyKey] of [
       [1, "INTERVIEW", "persistent-interview"],
@@ -845,7 +949,7 @@ describe("BizForge MCP HTTP server", () => {
     }
 
     const profile = {
-      snapshotId,
+      snapshotId: proposedSnapshotId,
       founderId,
       displayName: "Persistent Founder",
       competencies: [
@@ -881,21 +985,202 @@ describe("BizForge MCP HTTP server", () => {
         expectedVersion: 3,
         idempotencyKey: "persistent-confirm",
         profile,
-        isSynthetic: false,
       },
     });
     expect(published.isError, JSON.stringify(published.content)).not.toBe(true);
-    expect(asObject(published.structuredContent)).toMatchObject({
+    const publishedPayload = payloadOf(published);
+    const canonicalSnapshotId = String(publishedPayload.snapshotId);
+    expect(canonicalSnapshotId).toMatch(
+      /^snapshot-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(canonicalSnapshotId).not.toBe(proposedSnapshotId);
+    expect(asObject(published.structuredContent)).toEqual({
+      payload: {
+        snapshotId: canonicalSnapshotId,
+        setupState: "CONFIRMED",
+        stage2HandoffEligible: true,
+      },
+    });
+    expect(published.content).toEqual([
+      {
+        type: "text",
+        text: `Founder profile confirmed. Snapshot ${canonicalSnapshotId}; setup CONFIRMED; downstream research eligible.`,
+      },
+    ]);
+    expect(publishedPayload).toEqual({
+      snapshotId: canonicalSnapshotId,
+      setupState: "CONFIRMED",
+      stage2HandoffEligible: true,
+    });
+
+    const replayed = await client.callTool({
+      name: "bizforge_save_confirmed_founder_profile",
+      arguments: {
+        setupRunId,
+        expectedVersion: 3,
+        idempotencyKey: "persistent-confirm",
+        profile,
+      },
+    });
+    expect(replayed.isError, JSON.stringify(replayed.content)).not.toBe(true);
+    expect(payloadOf(replayed)).toEqual(publishedPayload);
+
+    await client.close();
+    clientClosed = true;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    serverClosed = true;
+    expect(firstStore.getFounderProfile(proposedSnapshotId)).toBeUndefined();
+    expect(firstStore.getFounderProfile(canonicalSnapshotId)?.value).toMatchObject({
+      snapshotId: canonicalSnapshotId,
+    });
+    firstStore.close();
+
+    restartedStore = new SqliteBizForgeDataStore(databasePath);
+    const restarted = await startServer(restartedStore);
+    restartedServer = restarted.server;
+    restartedClient = new Client({ name: "bizforge-restarted-test", version: "1.0.0" });
+    const restartedTransport = new StreamableHTTPClientTransport(
+      new URL(`${restarted.baseUrl}/mcp`),
+    );
+    await restartedClient.connect(restartedTransport);
+
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_get_founder_setup_run",
+          arguments: { setupRunId },
+        }),
+      ),
+    ).toMatchObject({ run: { founderId, state: "CONFIRMED", version: 4 } });
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_get_evidence",
+          arguments: { evidenceId },
+        }),
+      ),
+    ).toMatchObject({ evidence: { evidenceId, rawArtifactRef: evidence.rawArtifactRef } });
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_get_confirmed_founder_profile",
+          arguments: { snapshotId: canonicalSnapshotId },
+        }),
+      ),
+    ).toMatchObject({ profile: { snapshotId: canonicalSnapshotId, founderId } });
+
+    const replayedAfterRestart = await restartedClient.callTool({
+      name: "bizforge_save_confirmed_founder_profile",
+      arguments: {
+        setupRunId,
+        expectedVersion: 3,
+        idempotencyKey: "persistent-confirm",
+        profile,
+      },
+    });
+    expect(replayedAfterRestart.isError, JSON.stringify(replayedAfterRestart.content)).not.toBe(
+      true,
+    );
+    expect(payloadOf(replayedAfterRestart)).toEqual(publishedPayload);
+
+    const persistedEvidenceResource = await restartedClient.readResource({
+      uri: `bizforge://evidence/${evidenceId}`,
+    });
+    const persistedEvidenceContent = persistedEvidenceResource.contents[0];
+    if (persistedEvidenceContent === undefined || !("text" in persistedEvidenceContent)) {
+      throw new Error("Expected text evidence resource content after restart");
+    }
+    expect(JSON.parse(persistedEvidenceContent.text)).toMatchObject({
       storageBackend: "sqlite",
       isMock: false,
+      payload: {
+        evidence: {
+          evidenceId,
+          summary: evidence.summary,
+          rawArtifactRef: evidence.rawArtifactRef,
+        },
+      },
+    });
+
+    await restartedClient.close();
+    restartedClientClosed = true;
+    await new Promise<void>((resolve) => restarted.server.close(() => resolve()));
+    restartedServerClosed = true;
+    restartedStore.close();
+  });
+
+  it("defaults to local SQLite and uses memory only with an explicit mock mode", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bizforge-store-config-"));
+    cleanup.push(() => rm(directory, { recursive: true, force: true }));
+
+    const persistentStore = createConfiguredBizForgeDataStore({
+      cwd: directory,
+      environment: {},
+    });
+    expect(persistentStore).toBeInstanceOf(SqliteBizForgeDataStore);
+    expect(persistentStore.getDataStatus()).toMatchObject({
+      dataMode: "persistent",
+      storageBackend: "sqlite",
       ephemeral: false,
-      isSynthetic: false,
     });
-    expect(payloadOf(published)).toMatchObject({
-      stage2HandoffEligible: true,
-      mockStep2DemoEligible: false,
-      mockStep2Bundle: null,
+    if (persistentStore instanceof SqliteBizForgeDataStore) persistentStore.close();
+
+    const mockStore = createConfiguredBizForgeDataStore({
+      cwd: directory,
+      environment: { BIZFORGE_STORAGE_MODE: "mock" },
     });
+    expect(mockStore.getDataStatus()).toMatchObject({
+      dataMode: "mock",
+      storageBackend: "memory",
+      ephemeral: true,
+    });
+    expect(() =>
+      createConfiguredBizForgeDataStore({
+        cwd: directory,
+        environment: { BIZFORGE_STORAGE_MODE: "unknown" },
+      }),
+    ).toThrow(/must be either/);
+    expect(() =>
+      createConfiguredBizForgeDataStore({
+        cwd: directory,
+        environment: { BIZFORGE_DB_PATH: "" },
+      }),
+    ).toThrow(/must not be empty/);
+  });
+
+  it("starts and closes an owned configured SQLite store through the listen helper", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bizforge-owned-store-"));
+    let server: Awaited<ReturnType<typeof listenForBizForgeMcp>> | undefined;
+    cleanup.push(async () => {
+      const activeServer = server;
+      if (activeServer?.listening === true) {
+        await new Promise<void>((resolve) => activeServer.close(() => resolve()));
+      }
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    server = await listenForBizForgeMcp({
+      host: "127.0.0.1",
+      port: 0,
+      storeConfiguration: {
+        cwd: directory,
+        environment: { BIZFORGE_DB_PATH: "profile.sqlite" },
+      },
+    });
+    const address = server.address() as AddressInfo;
+    await expect(
+      fetch(`http://127.0.0.1:${address.port}/healthz`).then((response) => response.json()),
+    ).resolves.toMatchObject({
+      ok: true,
+      dataMode: "persistent",
+      storageBackend: "sqlite",
+      ephemeral: false,
+    });
+
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    const reopened = new SqliteBizForgeDataStore(join(directory, "profile.sqlite"));
+    expect(reopened.getDataStatus()).toMatchObject({ storageBackend: "sqlite" });
+    reopened.close();
   });
 
   it("serves health and rejects cross-origin or unknown routes", async () => {

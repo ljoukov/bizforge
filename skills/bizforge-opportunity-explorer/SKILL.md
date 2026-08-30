@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with the BizForge MCP Step 3 read tools; attach the evidence visualizer and opportunity challenger skills for UI and scrutiny.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge opportunity explorer
@@ -27,7 +27,8 @@ skill when the user asks for a chart, interactive comparison, challenge, or sens
 
 ## Read-only source of truth
 
-Call `bizforge_get_data_status` first. Then use only these BizForge MCP read tools:
+Call `bizforge_get_data_status` first and require `persistenceReady` plus
+`capabilities.step3ReadProjections`. Then use only these BizForge MCP read tools:
 
 - `bizforge_get_latest_research_bundle({})` when no bundle ID or founder ID was supplied. Omit
   `founderId` for the global latest bundle; never send `"*"`, `"all"`, `"latest"`, or another
@@ -45,17 +46,10 @@ Do not call Step 1 or Step 2 write tools. Do not query a database, sandbox file,
 source as a substitute for MCP data. Pin the chosen `bundleId` and `bundleVersion` for the whole
 answer. If the latest version changes, disclose that and ask before switching.
 
-If `isMock` is true, put a visible banner at the start of prose and every UI: `Mock demo data —
-ephemeral, source=<returned source>`. Use the selected record's actual source: `mock_seed` for a
-seeded fixture and `mcp_write` for a synthetic demo write. Repeat the label beside important
-numbers. A mock bundle produced from an explicitly synthetic Step 1 demo represents mocked Step
-2 output, not market research. Never present mock claims, buyers, measurements, or opportunities
-as real-world findings.
-
 ## Exploration workflow
 
 1. Load and pin the requested bundle. State its ID, version, research window, generated time,
-   embedded founder snapshot ID, warnings, and mock status. Resolve that exact snapshot when
+   embedded founder snapshot ID, and warnings. Resolve that exact snapshot when
    founder-fit context matters; never substitute a newer profile.
 2. Use `bizforge_list_opportunities` for the overview. Preserve opportunity IDs, original
    founder-fit ratings, confidence bounds, and warning language exactly. Do not invent a score
@@ -98,12 +92,12 @@ name the evidence needed to validate who controls budget and purchasing authorit
 
 Every substantive comparison must include:
 
-- pinned bundle ID/version and visible mock status;
+- pinned bundle ID/version and research window;
 - original opportunity IDs and unmodified founder-fit/confidence fields;
 - the strongest observed support and strongest counterpoint for each option;
 - provenance links by evidence ID for claims that drive the conclusion;
 - explicit gaps, coverage caveats, and assumptions;
 - a falsification next step with the MCP-provided success/failure criteria where available.
 
-Never fabricate plausible facts to fill an empty view. Never imply that code execution,
-visual polish, repetition across mock records, or model confidence strengthens evidence.
+Never fabricate plausible facts to fill an empty view. Never imply that code execution, visual
+polish, repetition, or model confidence strengthens evidence.

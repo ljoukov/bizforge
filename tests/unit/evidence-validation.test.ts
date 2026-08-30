@@ -168,6 +168,41 @@ describe("validateResearchBundle", () => {
     ]);
   });
 
+  it("reports unsupported claims without inventing a claim ID and rejects partial confidence", () => {
+    const bundle = researchBundle({
+      marketSignals: [
+        {
+          claims: [
+            {
+              kind: "observed",
+              statement: "An observation without an identifier or evidence.",
+              evidenceIds: [],
+            },
+          ],
+          confidence: { upper: 0.8 },
+        },
+      ],
+    });
+
+    const result = validateResearchBundle(bundle);
+
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "missing_evidence",
+          path: "$.marketSignals[0].claims[0].evidenceIds",
+        }),
+        expect.objectContaining({
+          code: "invalid_confidence_bounds",
+          path: "$.marketSignals[0].confidence",
+        }),
+      ]),
+    );
+    const missingEvidence = result.issues.find(({ code }) => code === "missing_evidence");
+    expect(missingEvidence).toBeDefined();
+    expect(missingEvidence).not.toHaveProperty("claimId");
+  });
+
   it("rejects duplicate evidence IDs because references would be ambiguous", () => {
     const bundle = researchBundle({}, ["evidence-1", "evidence-1"]);
 

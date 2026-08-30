@@ -5,7 +5,7 @@
   "description": "Evidence-backed business opportunity research powered by TrueForge.",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.13"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -14,7 +14,7 @@
     "format:check": "biome format .",
     "lint": "biome lint .",
     "mcp:serve": "npm run build && npm run mcp:start",
-    "mcp:start": "node dist/mcp/http-entrypoint.js",
+    "mcp:start": "node --env-file-if-exists=.env dist/mcp/http-entrypoint.js",
     "secrets:check": "node scripts/check-secrets.mjs",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",

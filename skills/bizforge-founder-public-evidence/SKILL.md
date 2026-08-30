@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, an approved public-data connector, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.3.0"
+  version: "0.5.0"
 ---
 
 # BizForge founder public evidence
@@ -42,16 +42,11 @@ Before external collection, verify these attached BizForge MCP tools:
 - `bizforge_put_evidence` and `bizforge_get_evidence` for canonical evidence;
 - `bizforge_request_founder_data_deletion` and `bizforge_get_deletion_status` for deletion.
 
-Call `bizforge_get_data_status` first. If `isMock` or `ephemeral` is true, do not call any
-external profile connector with a real person's URL or data and do not persist real founder
-data. Offer the interview-only `session_only` path. Only explicitly synthetic demo data may use
-mock writes after the user accepts the mock/ephemeral limitation. Visibly label it `mock=true`
-and show the exact returned `source`: `mcp_write` for a synthetic demo write and `mock_seed` only
-for a seeded fixture. For the accepted synthetic demo only, pass `isSynthetic: true` where the
-tool accepts it and `acceptMockStorage: true` on mock writes. This never authorizes collection of
-a real profile.
+Call `bizforge_get_data_status` first and require healthy persistent storage that accepts founder
+records. Keep backend, origin, and source fields internal during normal onboarding. If durable
+persistence is unavailable, do not call an external profile connector or collect profile data.
 
-In durable non-mock mode, an approved public-profile connector must also be attached. The
+An approved public-profile connector must also be attached. The
 TrueForge sandbox is temporary working space, not the durable evidence store; never use a
 sandbox path as a durable
 `rawArtifactRef`. If any required durable capability is unavailable, do not call the external
@@ -105,12 +100,13 @@ when persistence fails. Reconcile ambiguous writes with the matching read tool.
    - an exact locator such as a JSON pointer, record index, or short excerpt;
    - an optional observation time, durable `rawArtifactRef`, tags, and minimized attributes;
    - extraction method/version and, for agent extraction, host-injected session and turn IDs.
-   The application persistence boundary must inject authoritative runtime IDs. Never guess or
-   synthesize a TrueForge session, turn, tool-call, or input ID, and never ask the founder to
-   provide any internal ID. Use the founder/setup IDs returned by the MCP. Generate only
+   Use founder/setup IDs returned by BizForge MCP. Never guess or synthesize a TrueForge
+   session, turn, tool-call, or input ID, and never ask the founder to provide any internal ID.
+   Generate only
    schema-required opaque record and idempotency UUIDs in the enabled sandbox.
-8. **Minimize storage.** `rawArtifactRef` must point to a minimized, access-controlled source
-   extract in the durable BizForge artifact store, sufficient to resolve the locator. Do not
+8. **Minimize storage.** For a canonical retained item, use
+   `bizforge://evidence/{evidenceId}` as `rawArtifactRef`; the stored minimized EvidenceItem and
+   its locator excerpt must contain enough of the source extract to resolve that reference. Do not
    persist the complete provider payload unless a separate, explicit retention scope authorizes
    it. Delete temporary sandbox copies after durable persistence is confirmed.
 9. **Classify claims correctly.** A direct description of source text is `observed`. A
@@ -148,9 +144,8 @@ Never set `confirmedAt` and never label this output a confirmed `FounderProfileS
 Persist the consent records through their dedicated tool and store the conceptual evidence draft
 inside the versioned setup run. The transition tool validates its own CAS fields, not the draft's
 untyped `stateData`; enforce this skill's output and acceptance checks before calling it. A
-successful compare-and-set transition to `INTERVIEW` is the MCP-recorded handoff in the reported
-storage mode; it does not imply durability when that mode is mock/ephemeral. Chat output alone is
-not a handoff.
+successful compare-and-set transition to `INTERVIEW` is the persisted MCP-recorded handoff. Chat
+output alone is not a handoff.
 
 ## Prohibited inferences
 
@@ -174,9 +169,10 @@ Handle revocation by scope:
   until dependency closure is restored by a newly validated and confirmed snapshot.
 - Stage 2 processing revocation stops future founder-fit use without silently erasing records
   whose retention remains authorized.
-- A full deletion request inventories consent receipts, evidence artifacts, snapshots, claims,
-  research derivatives, indexes/caches, TrueForge session transcripts, provider-side retained
-  data, and backup-expiry obligations.
+- A setup-run deletion request inventories that run's consent receipts, evidence artifacts,
+  snapshots, claims, research derivatives, indexes/caches, TrueForge session transcripts,
+  provider-side retained data, and backup-expiry obligations. It does not imply deletion of a
+  different run for the same founder.
 
 Submit the inventory with `bizforge_request_founder_data_deletion` and report per-system status
 from `bizforge_get_deletion_status`. Do not claim deletion is complete while any system is
@@ -185,8 +181,8 @@ documented backup/provider expiry.
 
 ## Acceptance checks
 
-Before handoff, verify all of the following, plus a durable non-mock status from
-`bizforge_get_data_status` for any real founder:
+Before handoff, verify all of the following, plus healthy persistent status from
+`bizforge_get_data_status`:
 
 - No source call occurred before an explicit, recorded consent grant.
 - Identity is founder-confirmed or evidence remains explicitly unattached.

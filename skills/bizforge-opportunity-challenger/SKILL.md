@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a Daytona-backed sandbox and the BizForge MCP Step 3 read tools; Generative UI is optional for presenting the result.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge opportunity challenger
@@ -18,7 +18,8 @@ The output is a reversible analytical view, never a rewrite of the source artifa
 
 ## Read-only evidence boundary
 
-Call `bizforge_get_data_status`, then pin the requested bundle with
+Call `bizforge_get_data_status`, require `persistenceReady` plus
+`capabilities.step3ReadProjections`, then pin the requested bundle with
 `bizforge_get_latest_research_bundle({})` or `bizforge_get_research_bundle`. For global latest,
 pass an empty object and never invent a wildcard founder ID. Use
 `bizforge_get_confirmed_founder_profile` only for the exact snapshot ID embedded in that bundle,
@@ -27,10 +28,7 @@ and use `bizforge_list_opportunities`, `bizforge_get_opportunity`,
 supporting detail.
 
 Do not call Step 1/Step 2 write tools. Do not edit scores, claims, confidence bounds, evidence,
-or source files. If `isMock` is true, label the whole answer and every visual `Mock demo data —
-ephemeral, source=<returned source>`. Use the selected record's actual source: `mock_seed` for a
-seeded fixture and `mcp_write` for a synthetic demo write. Mock output is a workflow
-demonstration, not market evidence.
+or source files.
 
 ## Challenge workflow
 
@@ -101,7 +99,7 @@ Return:
 - a buyer-evidence gap where applicable;
 - a reversible, non-ranking sensitivity table only when the typed prerequisites exist;
 - the smallest falsification test and the decision it would change;
-- visible mock status and coverage caveats.
+- research-window and coverage caveats.
 
 If a Generative UI would materially help, the root agent must follow
 `bizforge-evidence-visualizer`, including the immediate

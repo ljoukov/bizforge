@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires a TrueForge root agent with Generative UI and sandbox enabled, a Daytona-backed sandbox runtime, and the BizForge MCP Step 3 read tools.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge evidence visualizer
@@ -13,15 +13,16 @@ metadata:
 ## Purpose
 
 Turn a pinned Step 2 `ResearchBundle` into a compact, legible Generative UI while preserving its
-epistemic labels, provenance, and uncertainty. Visual presentation must never make weak or mock
-evidence look stronger.
+epistemic labels, provenance, and uncertainty. Visual presentation must never make weak evidence
+look stronger.
 
 This skill is for the TrueForge **root agent**. Child agents do not receive OpenUI and must not
 author the final interface.
 
 ## Source and data-mode gate
 
-Call `bizforge_get_data_status` first. Read source data only through:
+Call `bizforge_get_data_status` first and require `persistenceReady` plus
+`capabilities.step3ReadProjections`. Read source data only through:
 
 - `bizforge_get_latest_research_bundle({})` or `bizforge_get_research_bundle`. For global latest,
   pass an empty object and never invent a wildcard founder ID;
@@ -35,11 +36,7 @@ Step 3 is read-only. Do not call Step 1/Step 2 write tools, inspect the backing 
 credentials into generated code.
 
 Pin and display `bundleId`, `bundleVersion`, and the embedded founder snapshot ID. Never replace
-that snapshot with a newer profile while explaining the bundle. If `isMock` is true, every prose
-answer and every rendered view must visibly say `Mock demo data — ephemeral, source=<returned
-source>`. Use the selected record's actual source: `mock_seed` for a seeded fixture and
-`mcp_write` for a synthetic demo write. Place the label near charts and headline figures, not
-only in a footnote.
+that snapshot with a newer profile while explaining the bundle.
 
 ## OpenUI protocol
 
@@ -117,7 +114,7 @@ fabricated score and do not call a nonexistent reranking tool.
 
 Use the smallest useful view. A strong default is:
 
-- a visible mock/real data-status banner;
+- a compact bundle/version and research-window header;
 - a compact opportunity comparison with original IDs and epistemic labels;
 - at most one eligible chart supporting the current question;
 - an adjacent human-readable table or numeric summary;
@@ -138,7 +135,6 @@ Before emitting the UI, verify that:
 
 - all displayed facts trace to the pinned bundle/version or an explicitly labelled deterministic
   derivation;
-- mock data is unmistakably labelled in prose and UI;
 - chart arithmetic matches the MCP projection;
 - no buyer strength or numeric rank was derived from unbound prose;
 - a table/summary makes the result understandable without the chart;
