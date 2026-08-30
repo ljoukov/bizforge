@@ -1,7 +1,7 @@
 import { TrueForge, type TrueForgeApi, TrueForgeError } from "@truefoundry/trueforge-sdk";
 
 import {
-  AgentSessionSubmissionUnknownError,
+  AgentSessionCreationIndeterminateError,
   AgentTurnSubmissionUnknownError,
   type AgentActionResolution,
   type AgentRequiredAction,
@@ -25,8 +25,9 @@ export interface TrueForgeAgentRuntimeOptions {
  * Headless TrueForge adapter for one saved agent per batch session.
  *
  * Creating sessions and turns deliberately disables SDK retries. Those POSTs
- * have no documented idempotency key, so an ambiguous response must be
- * reconciled rather than silently duplicated.
+ * have no documented idempotency key. An ambiguous turn can be inspected in
+ * its known session; an ambiguous session creation cannot be correlated
+ * exactly and must fail closed for manual handling.
  */
 export class TrueForgeAgentRuntime implements AgentRuntime {
   readonly #client: TrueForgeClient;
@@ -55,7 +56,9 @@ export class TrueForgeAgentRuntime implements AgentRuntime {
       if (isDefinitiveClientRejection(error)) {
         throw error;
       }
-      throw new AgentSessionSubmissionUnknownError(request.agent.agentName, { cause: error });
+      throw new AgentSessionCreationIndeterminateError(request.attemptId, request.agent.agentName, {
+        cause: error,
+      });
     }
   }
 

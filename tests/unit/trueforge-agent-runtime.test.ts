@@ -7,7 +7,7 @@ import {
   TrueForgeAgentRuntime,
 } from "../../src/adapters/trueforge/trueforge-agent-runtime.js";
 import {
-  AgentSessionSubmissionUnknownError,
+  AgentSessionCreationIndeterminateError,
   AgentTurnSubmissionUnknownError,
 } from "../../src/ports/agent-runtime.js";
 
@@ -169,7 +169,13 @@ describe("TrueForgeAgentRuntime", () => {
     const signal = new AbortController().signal;
 
     await expect(
-      runtime.createSession({ agent: { kind: "SAVED", agentName: "bizforge-research" } }, signal),
+      runtime.createSession(
+        {
+          attemptId: "run-17:session-1",
+          agent: { kind: "SAVED", agentName: "bizforge-research" },
+        },
+        signal,
+      ),
     ).resolves.toEqual({ sessionId: "session-1" });
 
     expect(sessions.create).toHaveBeenCalledWith(
@@ -179,7 +185,7 @@ describe("TrueForgeAgentRuntime", () => {
     expect(sessions.createTurn).not.toHaveBeenCalled();
   });
 
-  it("surfaces an ambiguous session submission as typed and non-retryable", async () => {
+  it("fails an ambiguous session creation closed with its persisted attempt ID", async () => {
     const { client, sessions } = createFakeClient();
     const networkError = new Error("connection closed before a response arrived");
     sessions.create.mockRejectedValueOnce(networkError);
@@ -190,18 +196,75 @@ describe("TrueForgeAgentRuntime", () => {
 
     const caught: unknown = await runtime
       .createSession(
-        { agent: { kind: "SAVED", agentName: "bizforge-research" } },
+        {
+          attemptId: "run-ambiguous:session-1",
+          agent: { kind: "SAVED", agentName: "bizforge-research" },
+        },
         new AbortController().signal,
       )
       .catch((error: unknown) => error);
 
-    expect(caught).toBeInstanceOf(AgentSessionSubmissionUnknownError);
+    expect(caught).toBeInstanceOf(AgentSessionCreationIndeterminateError);
     expect(caught).toMatchObject({
-      code: "AGENT_SESSION_SUBMISSION_UNKNOWN",
+      code: "AGENT_SESSION_CREATION_INDETERMINATE",
       retryable: false,
+      recovery: "MANUAL_ONLY",
+      orphanPossible: true,
+      attemptId: "run-ambiguous:session-1",
       agentName: "bizforge-research",
       cause: networkError,
     });
+    expect(sessions.create).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([408, 425, 429])(
+    "treats HTTP %i during session creation as indeterminate rather than retryable",
+    async (statusCode) => {
+      const { client, sessions } = createFakeClient();
+      sessions.create.mockRejectedValueOnce(
+        new TrueForgeError({ message: "Request outcome unknown", statusCode }),
+      );
+      const runtime = new TrueForgeAgentRuntime({
+        baseUrl: "http://localhost:8790",
+        client,
+      });
+
+      await expect(
+        runtime.createSession(
+          {
+            attemptId: `run-http-${statusCode}:session-1`,
+            agent: { kind: "SAVED", agentName: "bizforge-research" },
+          },
+          new AbortController().signal,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_SESSION_CREATION_INDETERMINATE",
+        retryable: false,
+        recovery: "MANUAL_ONLY",
+      });
+      expect(sessions.create).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("preserves a definitive session-creation rejection", async () => {
+    const { client, sessions } = createFakeClient();
+    const rejection = new TrueForgeError({ message: "Unknown agent", statusCode: 404 });
+    sessions.create.mockRejectedValueOnce(rejection);
+    const runtime = new TrueForgeAgentRuntime({
+      baseUrl: "http://localhost:8790",
+      client,
+    });
+
+    await expect(
+      runtime.createSession(
+        {
+          attemptId: "run-invalid-agent:session-1",
+          agent: { kind: "SAVED", agentName: "missing-agent" },
+        },
+        new AbortController().signal,
+      ),
+    ).rejects.toBe(rejection);
+    expect(sessions.create).toHaveBeenCalledTimes(1);
   });
 
   it("starts a non-retrying background turn in a persisted session", async () => {

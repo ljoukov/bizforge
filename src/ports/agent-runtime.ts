@@ -1,6 +1,12 @@
 export type AgentReference = Readonly<{ kind: "SAVED"; agentName: string }>;
 
 export interface CreateAgentSessionRequest {
+  /**
+   * Application-owned ID persisted before the non-idempotent provider call.
+   * TrueForge cannot store or query it; it exists for audit and operator
+   * recovery only, never for automatic provider-side correlation.
+   */
+  readonly attemptId: string;
   readonly agent: AgentReference;
 }
 
@@ -21,21 +27,27 @@ export interface AgentTurnReference {
 }
 
 /**
- * Session creation is non-idempotent. A transport failure can hide a session
- * that the provider already created, so callers must reconcile by agent/run
- * metadata rather than blindly creating another session.
+ * Session creation is non-idempotent and TrueForge accepts no idempotency key
+ * or client correlation value. A transport failure can therefore hide a
+ * session that the provider already created. The outcome is terminal for the
+ * current run: do not retry or guess from agent names and timestamps. Record
+ * the attempt for manual investigation and require an operator-authorized new
+ * attempt if the run should continue.
  */
-export class AgentSessionSubmissionUnknownError extends Error {
-  override readonly name = "AgentSessionSubmissionUnknownError";
-  readonly code = "AGENT_SESSION_SUBMISSION_UNKNOWN";
+export class AgentSessionCreationIndeterminateError extends Error {
+  override readonly name = "AgentSessionCreationIndeterminateError";
+  readonly code = "AGENT_SESSION_CREATION_INDETERMINATE";
   readonly retryable = false;
+  readonly recovery = "MANUAL_ONLY";
+  readonly orphanPossible = true;
 
   constructor(
+    readonly attemptId: string,
     readonly agentName: string,
     options?: ErrorOptions,
   ) {
     super(
-      `Agent session submission outcome is unknown for ${agentName}; reconcile before resubmitting`,
+      `Agent session creation outcome is indeterminate for attempt ${attemptId} (${agentName}); automatic retry or name/time-based recovery is unsafe`,
       options,
     );
   }
@@ -120,7 +132,9 @@ export type AgentActionResolution =
 export interface AgentRuntime {
   /**
    * Creates a session as a separate durability boundary. Callers must persist
-   * the returned reference before attempting the first turn.
+   * `request.attemptId` before calling and the returned reference before
+   * attempting the first turn. An indeterminate creation outcome must fail the
+   * run non-retryably and be handled through manual operator policy.
    */
   createSession(
     request: CreateAgentSessionRequest,

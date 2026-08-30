@@ -87,3 +87,12 @@ blindly because that can duplicate paid work.
 TrueForge will reach the pipeline through a narrow BizForge MCP server rather than receiving raw
 credentials. The initial tools will preview cost, enqueue an approved collection plan, inspect
 status, query evidence and calculate signals.
+
+TrueForge session creation is a special failure boundary. Its create API has neither an
+idempotency key nor a client-reference field, and sessions created from the same saved agent cannot
+be distinguished reliably by timestamps. The runner must persist an application `attemptId` before
+the request and persist the returned session ID before starting a turn. If the response is lost,
+the run fails non-retryably as `AGENT_SESSION_CREATION_INDETERMINATE`; it must not guess a session or
+submit again automatically. The attempt ID supports audit and an explicit operator decision, not
+provider-side correlation. Exact automated recovery would require TrueForge to echo a unique client
+reference or honor an idempotency key.

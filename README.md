@@ -32,6 +32,7 @@ The first implementation slice establishes the contracts and safety rails for St
 - research-bundle validation;
 - provider ports, plus a headless TrueForge session/turn adapter; the Bright Data adapter follows
   in the ingestion PR;
+- fail-closed handling for indeterminate, non-idempotent TrueForge session creation;
 - automated formatting, linting, type checking, tests and builds.
 
 See [the architecture](docs/architecture.md) for the planned runtime boundaries.

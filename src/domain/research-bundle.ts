@@ -7,7 +7,7 @@ import {
   IsoDateTimeSchema,
   NonEmptyStringSchema,
 } from "./common.js";
-import { EvidenceItemSchema } from "./evidence.js";
+import { type EvidenceItem, EvidenceItemSchema } from "./evidence.js";
 import { ConfirmedFounderProfileSnapshotSchema } from "./founder-profile.js";
 import { MarketSignalSchema } from "./market-signal.js";
 import {
@@ -28,6 +28,26 @@ function claimSetsInBundle(bundle: BundleClaimSources): ClaimSet[] {
     ...bundle.marketSignals.map(({ claims }) => claims),
     ...bundle.opportunities.flatMap(claimSetsInOpportunity),
   ];
+}
+
+interface TimedEvidenceReference {
+  readonly id: string;
+  readonly path: (string | number)[];
+  readonly consumedAt: string;
+  readonly postdatedMessage: string;
+}
+
+function findPostdatedEvidence(
+  evidenceById: ReadonlyMap<string, EvidenceItem>,
+  references: readonly TimedEvidenceReference[],
+): Array<Pick<TimedEvidenceReference, "path" | "postdatedMessage">> {
+  return references.flatMap((reference) => {
+    const evidence = evidenceById.get(reference.id);
+    return evidence !== undefined &&
+      Date.parse(evidence.provenance.retrievedAt) > Date.parse(reference.consumedAt)
+      ? [{ path: reference.path, postdatedMessage: reference.postdatedMessage }]
+      : [];
+  });
 }
 
 export const ResearchBundleSchema = z
@@ -108,50 +128,39 @@ export const ResearchBundleSchema = z
     const evidenceById = new Map(
       bundle.evidence.map((evidence) => [evidence.evidenceId, evidence]),
     );
-    for (const [index, evidenceId] of bundle.founderProfile.sourceEvidenceIds.entries()) {
-      const evidence = evidenceById.get(evidenceId);
-      if (
-        evidence !== undefined &&
-        Date.parse(evidence.provenance.retrievedAt) > Date.parse(bundle.founderProfile.confirmedAt)
-      ) {
-        context.addIssue({
-          code: "custom",
-          path: ["founderProfile", "sourceEvidenceIds", index],
-          message: `founder evidence ${evidenceId} was retrieved after the profile was confirmed`,
-        });
-      }
-    }
-
-    for (const [signalIndex, signal] of bundle.marketSignals.entries()) {
-      for (const [evidenceIndex, evidenceId] of signal.evidenceIds.entries()) {
-        const evidence = evidenceById.get(evidenceId);
-        if (
-          evidence !== undefined &&
-          Date.parse(evidence.provenance.retrievedAt) > Date.parse(signal.calculatedAt)
-        ) {
-          context.addIssue({
-            code: "custom",
-            path: ["marketSignals", signalIndex, "evidenceIds", evidenceIndex],
-            message: `signal evidence ${evidenceId} was retrieved after the signal was calculated`,
-          });
-        }
-      }
-    }
-
-    for (const [opportunityIndex, opportunity] of bundle.opportunities.entries()) {
-      for (const [evidenceIndex, evidenceId] of opportunity.evidenceIds.entries()) {
-        const evidence = evidenceById.get(evidenceId);
-        if (
-          evidence !== undefined &&
-          Date.parse(evidence.provenance.retrievedAt) > Date.parse(opportunity.generatedAt)
-        ) {
-          context.addIssue({
-            code: "custom",
-            path: ["opportunities", opportunityIndex, "evidenceIds", evidenceIndex],
-            message: `opportunity evidence ${evidenceId} was retrieved after the dossier was generated`,
-          });
-        }
-      }
+    // Each artifact schema requires every nested claim citation to be present
+    // in its aggregate evidenceIds, so these checks cover direct and nested
+    // evidence without relying on the weaker bundle.generatedAt boundary.
+    const timedEvidenceReferences: TimedEvidenceReference[] = [
+      ...bundle.founderProfile.sourceEvidenceIds.map((evidenceId, index) => ({
+        id: evidenceId,
+        path: ["founderProfile", "sourceEvidenceIds", index],
+        consumedAt: bundle.founderProfile.confirmedAt,
+        postdatedMessage: `founder evidence ${evidenceId} was retrieved after the profile was confirmed`,
+      })),
+      ...bundle.marketSignals.flatMap((signal, signalIndex) =>
+        signal.evidenceIds.map((evidenceId, evidenceIndex) => ({
+          id: evidenceId,
+          path: ["marketSignals", signalIndex, "evidenceIds", evidenceIndex],
+          consumedAt: signal.calculatedAt,
+          postdatedMessage: `signal evidence ${evidenceId} was retrieved after the signal was calculated`,
+        })),
+      ),
+      ...bundle.opportunities.flatMap((opportunity, opportunityIndex) =>
+        opportunity.evidenceIds.map((evidenceId, evidenceIndex) => ({
+          id: evidenceId,
+          path: ["opportunities", opportunityIndex, "evidenceIds", evidenceIndex],
+          consumedAt: opportunity.generatedAt,
+          postdatedMessage: `opportunity evidence ${evidenceId} was retrieved after the dossier was generated`,
+        })),
+      ),
+    ];
+    for (const issue of findPostdatedEvidence(evidenceById, timedEvidenceReferences)) {
+      context.addIssue({
+        code: "custom",
+        path: issue.path,
+        message: issue.postdatedMessage,
+      });
     }
 
     const allClaims = claimSetsInBundle(bundle).flatMap(flattenClaimSet);
