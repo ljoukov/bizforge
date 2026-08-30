@@ -220,6 +220,101 @@ describe("InMemoryBizForgeDataStore", () => {
     ).toThrow(/synthetic records only/);
   });
 
+  it("assigns opaque runtime IDs and replays an explicit setup ID without a founder ID", () => {
+    const store = makeStore();
+    const generated = store.createSetupRun({ isSynthetic: true });
+
+    expect(generated.value.founderId).toMatch(/^founder-[0-9a-f-]+$/);
+    expect(generated.value.setupRunId).toMatch(/^setup-[0-9a-f-]+$/);
+
+    const explicit = store.createSetupRun({
+      founderId: "founder-explicit",
+      setupRunId: "setup-explicit",
+      isSynthetic: true,
+    });
+    expect(store.createSetupRun({ setupRunId: "setup-explicit", isSynthetic: true })).toEqual(
+      explicit,
+    );
+  });
+
+  it("replays generated setup IDs by client request and rejects conflicting key reuse", () => {
+    const store = makeStore();
+    const request = {
+      clientRequestId: "application-generated-create-request",
+      isSynthetic: true,
+    } as const;
+    const created = store.createSetupRun(request);
+
+    expect(store.createSetupRun(request)).toEqual(created);
+    expect(() =>
+      store.createSetupRun({ ...request, founderId: "founder-conflicting-retry" }),
+    ).toThrow(/clientRequestId was already used with different parameters/);
+  });
+
+  it("supports idempotent INTERVIEW checkpoints when callers merge replacement stateData", () => {
+    const store = makeStore();
+    store.createSetupRun({
+      founderId: "founder-interview-checkpoint",
+      setupRunId: "setup-interview-checkpoint",
+      isSynthetic: true,
+    });
+    const enteredInterview = store.transitionSetupRun({
+      setupRunId: "setup-interview-checkpoint",
+      expectedVersion: 1,
+      targetState: "INTERVIEW",
+      idempotencyKey: "enter-interview",
+      stateData: {
+        answers: { competency: "workflow automation" },
+        answeredFields: ["competency"],
+      },
+    });
+    const mergedStateData = {
+      ...enteredInterview.run.stateData,
+      answers: {
+        ...(enteredInterview.run.stateData.answers as Record<string, unknown>),
+        availabilityHoursPerWeek: 15,
+      },
+      answeredFields: ["competency", "availabilityHoursPerWeek"],
+    };
+    const checkpointInput = {
+      setupRunId: "setup-interview-checkpoint",
+      expectedVersion: 2,
+      targetState: "INTERVIEW" as const,
+      idempotencyKey: "interview-checkpoint-2",
+      stateData: mergedStateData,
+    };
+
+    expect(store.transitionSetupRun(checkpointInput)).toMatchObject({
+      replayed: false,
+      run: { state: "INTERVIEW", version: 3, stateData: mergedStateData },
+    });
+    expect(store.transitionSetupRun(checkpointInput)).toMatchObject({
+      replayed: true,
+      run: { state: "INTERVIEW", version: 3, stateData: mergedStateData },
+    });
+    expect(() =>
+      store.transitionSetupRun({
+        ...checkpointInput,
+        stateData: { availabilityHoursPerWeek: 20 },
+      }),
+    ).toThrow(/idempotency key/);
+    expect(() =>
+      store.transitionSetupRun({
+        ...checkpointInput,
+        idempotencyKey: "stale-interview-checkpoint",
+      }),
+    ).toThrow(/current version is 3/);
+
+    const replacement = store.transitionSetupRun({
+      setupRunId: "setup-interview-checkpoint",
+      expectedVersion: 3,
+      targetState: "INTERVIEW",
+      idempotencyKey: "replacement-semantics",
+      stateData: { latestAnswerOnly: true },
+    });
+    expect(replacement.run.stateData).toEqual({ latestAnswerOnly: true });
+  });
+
   it("requires effective purpose-specific consent for founder evidence", () => {
     const store = makeStore();
     store.createSetupRun({
@@ -697,6 +792,12 @@ describe("InMemoryBizForgeDataStore", () => {
       founderId: "founder-delete",
       evidenceId: "evidence-delete",
     });
+    store.createSetupRun({
+      clientRequestId: "application-create-delete",
+      setupRunId: prepared.setupRunId,
+      founderId: prepared.founderId,
+      isSynthetic: true,
+    });
     const confirmationInput = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
@@ -734,6 +835,21 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
     expect(store.getDeletionStatus(deletion.deletionRequestId)).toEqual(deletionRecord);
     expect(store.getDeletionStatus("missing")).toBeUndefined();
+    expect(() =>
+      store.createSetupRun({
+        clientRequestId: "application-create-delete",
+        setupRunId: prepared.setupRunId,
+        founderId: prepared.founderId,
+        isSynthetic: true,
+      }),
+    ).toThrow(/deleted setup run.*fresh clientRequestId/);
+    const postDeletionCreate = store.createSetupRun({
+      clientRequestId: "application-create-after-delete",
+      isSynthetic: true,
+    });
+    expect(postDeletionCreate.value.setupRunId).not.toBe(prepared.setupRunId);
+    expect(postDeletionCreate.value.founderId).not.toBe(prepared.founderId);
+    expect(store.getSetupRun(prepared.setupRunId)).toBeUndefined();
     expect(
       store.requestDeletion({
         setupRunId: prepared.setupRunId,

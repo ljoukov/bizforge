@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, all three BizForge founder subskills, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge founder setup coordinator
@@ -54,7 +54,33 @@ store durable or authorize real founder data.
 
 Verify the public-profile connector only if the founder requests profile enrichment and the MCP
 reports a durable non-mock mode. Never use the temporary TrueForge sandbox as the durable store
-and never invent missing runtime IDs.
+and never expose infrastructure requirements as founder questions.
+
+## Conversation bootstrap and internal IDs
+
+A new setup may begin with one short, non-sensitive seed such as `workflow and operations
+automation`. Treat that phrase as a candidate competency or area of interest, not as a complete
+profile and not as permission to manufacture missing answers. Acknowledge it naturally, then run
+the minimum interview for the founder's actual preferences and constraints. Never require a
+prepared scenario, JSON, a display name, or a long intake form in the first user message.
+
+`founderId`, `setupRunId`, consent/evidence/snapshot IDs, and idempotency keys are
+application-controlled identifiers. Never ask the founder to supply any of them. For a new run,
+generate an opaque `clientRequestId` UUID in the enabled sandbox, then call
+`bizforge_create_founder_setup_run` with both `founderId` and `setupRunId` omitted. The MCP
+allocates and returns both IDs. Retain the creation key until the response is reconciled; if that
+response is ambiguous, retry the exact same create input with the same key so the MCP replays the
+same run. Keep the returned founder/setup IDs in the run context and use them in later tool
+calls. On resume, use only IDs previously returned by an authoritative MCP record. Where a later
+schema requires a caller-generated record ID or idempotency key, create another opaque
+collision-resistant UUID in the sandbox and never derive it from the founder's name or answers.
+TrueForge session and turn IDs are different: use them only when the host exposes them; never ask
+the founder for host metadata or fabricate it.
+
+In mock/ephemeral mode, the first response may need one concise storage-and-consent gate before
+anything is retained. Ask that gate in founder language, not infrastructure language. After it
+is accepted, create the run internally and continue the interview. Do not expose tool argument
+names, schema requirements, or generated IDs as questions.
 
 If durable capabilities are missing or the MCP reports mock/ephemeral mode, permit a clearly
 labelled `session_only` interview draft
@@ -72,7 +98,7 @@ state, and an idempotency key. On an ambiguous write, reconcile with
 
 ## State machine
 
-Use one host-provided `setupRunId` and move only through these states:
+Use the MCP-created `setupRunId` and move only through these states:
 
 ```text
 CONSENT_PENDING
@@ -81,6 +107,7 @@ CONSENT_PENDING
 PUBLIC_EVIDENCE
   -> INTERVIEW
 INTERVIEW
+  -> INTERVIEW             after a merged incremental interview checkpoint
   -> DRAFT_REVIEW          only when required fields and one competency are supported
 DRAFT_REVIEW
   -> DRAFT_REVIEW          after edits
@@ -104,11 +131,14 @@ records.
    professional profile. Obtain its separate consent scopes before any source call. If the
    founder declines or required tools are absent, record the interview-only branch.
 2. Before retaining any interview answer, obtain separate consent for minimized self-report
-   evidence, snapshot retention, optional version history, and optional Stage 2 use. This gate
-   applies equally to the interview-only branch. Then load `bizforge-founder-minimum-interview`,
-   compute a field gap map, and ask only what remains missing, candidate, or contradictory. Use
-   choice controls for enums/skip/confirmation and ordinary chat or Generative UI for
-   numeric/free-text answers.
+   evidence, snapshot retention, optional version history, and optional Stage 2 use. Present
+   these scopes together in one compact, plain-language consent control when possible, while
+   recording one immutable MCP consent event per scope. This gate applies equally to the
+   interview-only branch. Then load `bizforge-founder-minimum-interview`, compute a field gap
+   map, and ask only what remains missing, candidate, or contradictory. Treat a one-line opening
+   seed as a candidate competency that still needs level/experience confirmation. Use choice
+   controls for enums/skip/confirmation and ordinary chat or Generative UI for numeric/free-text
+   answers.
 3. When `readyForDraft` is true and persistence succeeded, load
    `bizforge-founder-thesis-editor`. Apply corrections and base-validate the draft with
    `confirmedAt` absent. Show the exact version and obtain explicit approval. Only then have the

@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, an approved public-data connector, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge founder public evidence
@@ -106,7 +106,9 @@ when persistence fails. Reconcile ambiguous writes with the matching read tool.
    - an optional observation time, durable `rawArtifactRef`, tags, and minimized attributes;
    - extraction method/version and, for agent extraction, host-injected session and turn IDs.
    The application persistence boundary must inject authoritative runtime IDs. Never guess or
-   synthesize a TrueForge session, turn, tool-call, or input ID.
+   synthesize a TrueForge session, turn, tool-call, or input ID, and never ask the founder to
+   provide any internal ID. Use the founder/setup IDs returned by the MCP. Generate only
+   schema-required opaque record and idempotency UUIDs in the enabled sandbox.
 8. **Minimize storage.** `rawArtifactRef` must point to a minimized, access-controlled source
    extract in the durable BizForge artifact store, sufficient to resolve the locator. Do not
    persist the complete provider payload unless a separate, explicit retention scope authorizes

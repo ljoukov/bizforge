@@ -10,6 +10,16 @@ import { createSeededBizForgeDataStore } from "../../src/mcp/server.js";
 
 type JsonObject = Record<string, unknown>;
 
+const createRequestIds = {
+  missingMockAcceptance: "00000000-0000-4000-8000-000000000001",
+  seededReplay: "00000000-0000-4000-8000-000000000002",
+  rejectedRealData: "00000000-0000-4000-8000-000000000003",
+  generatedRun: "00000000-0000-4000-8000-000000000004",
+  explicitReplay: "00000000-0000-4000-8000-000000000005",
+  endToEnd: "00000000-0000-4000-8000-000000000006",
+  persistent: "00000000-0000-4000-8000-000000000007",
+} as const;
+
 function asObject(value: unknown): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("Expected an object");
@@ -118,6 +128,31 @@ describe("BizForge MCP HTTP server", () => {
     expect(growthOutputSchema).toBeDefined();
     expect(JSON.stringify(growthOutputSchema)).not.toContain('"prefixItems"');
     expect(JSON.stringify(growthOutputSchema)).not.toContain('"items":false');
+    const createSetupTool = listed.tools.find(
+      ({ name }) => name === "bizforge_create_founder_setup_run",
+    );
+    if (createSetupTool === undefined) throw new Error("missing setup creation tool");
+    const createSetupInputSchema = asObject(createSetupTool.inputSchema);
+    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain("founderId");
+    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain("setupRunId");
+    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain(
+      "clientRequestId",
+    );
+    expect(createSetupTool.title).toContain("server-assigned");
+    expect(createSetupTool.description).toContain("never ask the end user");
+    expect(createSetupTool.annotations).toMatchObject({ idempotentHint: false });
+    expect(asObject(asObject(createSetupInputSchema.properties).clientRequestId)).toMatchObject({
+      format: "uuid",
+    });
+    expect(
+      asObject(asObject(createSetupInputSchema.properties).clientRequestId).description,
+    ).toContain("never request it from an end user");
+    expect(asObject(asObject(createSetupInputSchema.properties).founderId).description).toContain(
+      "Never request this ID from an end user",
+    );
+    expect(asObject(asObject(createSetupInputSchema.properties).setupRunId).description).toContain(
+      "Never request this ID from an end user",
+    );
 
     const status = await client.callTool({ name: "bizforge_get_data_status", arguments: {} });
     expect(asObject(status.structuredContent)).toMatchObject({
@@ -134,6 +169,7 @@ describe("BizForge MCP HTTP server", () => {
     const missingMockAcceptance = await client.callTool({
       name: "bizforge_create_founder_setup_run",
       arguments: {
+        clientRequestId: createRequestIds.missingMockAcceptance,
         founderId: "founder-missing-mock-acceptance",
         isSynthetic: true,
       },
@@ -144,6 +180,7 @@ describe("BizForge MCP HTTP server", () => {
     const seededRunReplay = await client.callTool({
       name: "bizforge_create_founder_setup_run",
       arguments: {
+        clientRequestId: createRequestIds.seededReplay,
         founderId: "founder-synthetic-demo",
         setupRunId: "setup-synthetic-demo",
         isSynthetic: true,
@@ -233,6 +270,7 @@ describe("BizForge MCP HTTP server", () => {
     const rejectedRealData = await client.callTool({
       name: "bizforge_create_founder_setup_run",
       arguments: {
+        clientRequestId: createRequestIds.rejectedRealData,
         founderId: "founder-rejected-real-data",
         isSynthetic: false,
         acceptMockStorage: true,
@@ -240,17 +278,62 @@ describe("BizForge MCP HTTP server", () => {
     });
     expect(rejectedRealData.isError).toBe(true);
     expect(JSON.stringify(rejectedRealData.content)).toContain("synthetic records only");
-    const autoRun = payloadOf(
+    const legacyUnkeyedRun = payloadOf(
       await client.callTool({
         name: "bizforge_create_founder_setup_run",
         arguments: {
-          founderId: "founder-auto-id",
           isSynthetic: true,
           acceptMockStorage: true,
         },
       }),
     );
+    expect(asObject(legacyUnkeyedRun.run).setupRunId).toMatch(/^setup-/);
+    expect(asObject(legacyUnkeyedRun.run).founderId).toMatch(/^founder-/);
+    const generatedRunArguments = {
+      clientRequestId: createRequestIds.generatedRun,
+      isSynthetic: true,
+      acceptMockStorage: true,
+    };
+    const autoRun = payloadOf(
+      await client.callTool({
+        name: "bizforge_create_founder_setup_run",
+        arguments: generatedRunArguments,
+      }),
+    );
     expect(asObject(autoRun.run).setupRunId).toMatch(/^setup-/);
+    expect(asObject(autoRun.run).founderId).toMatch(/^founder-/);
+    const retriedAutoRun = payloadOf(
+      await client.callTool({
+        name: "bizforge_create_founder_setup_run",
+        arguments: generatedRunArguments,
+      }),
+    );
+    expect(retriedAutoRun.run).toEqual(autoRun.run);
+    const conflictingAutoRun = await client.callTool({
+      name: "bizforge_create_founder_setup_run",
+      arguments: { ...generatedRunArguments, founderId: "founder-conflicting-retry" },
+    });
+    expect(conflictingAutoRun.isError).toBe(true);
+    expect(JSON.stringify(conflictingAutoRun.content)).toContain(
+      "clientRequestId was already used with different parameters",
+    );
+    const explicitReplayWithoutFounder = payloadOf(
+      await client.callTool({
+        name: "bizforge_create_founder_setup_run",
+        arguments: {
+          clientRequestId: createRequestIds.explicitReplay,
+          setupRunId: "setup-synthetic-demo",
+          isSynthetic: true,
+          acceptMockStorage: true,
+        },
+      }),
+    );
+    expect(explicitReplayWithoutFounder).toMatchObject({
+      run: {
+        setupRunId: "setup-synthetic-demo",
+        founderId: "founder-synthetic-demo",
+      },
+    });
     expect(
       payloadOf(
         await client.callTool({
@@ -268,7 +351,13 @@ describe("BizForge MCP HTTP server", () => {
     const snapshotId = "snapshot-e2e";
     const createResult = await client.callTool({
       name: "bizforge_create_founder_setup_run",
-      arguments: { founderId, setupRunId, isSynthetic: true, acceptMockStorage: true },
+      arguments: {
+        clientRequestId: createRequestIds.endToEnd,
+        founderId,
+        setupRunId,
+        isSynthetic: true,
+        acceptMockStorage: true,
+      },
     });
     expect(payloadOf(createResult)).toMatchObject({
       run: { state: "CONSENT_PENDING", version: 1 },
@@ -675,7 +764,12 @@ describe("BizForge MCP HTTP server", () => {
     const snapshotId = "snapshot-persistent";
     const created = await client.callTool({
       name: "bizforge_create_founder_setup_run",
-      arguments: { founderId, setupRunId, isSynthetic: false },
+      arguments: {
+        clientRequestId: createRequestIds.persistent,
+        founderId,
+        setupRunId,
+        isSynthetic: false,
+      },
     });
     expect(created.isError).not.toBe(true);
     expect(asObject(created.structuredContent)).toMatchObject({

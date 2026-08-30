@@ -364,25 +364,45 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
   server.registerTool(
     "bizforge_create_founder_setup_run",
     {
-      title: "Create founder setup run",
-      description: "Create a versioned Step 1 setup run in the active storage adapter.",
+      title: "Start founder setup with server-assigned runtime IDs",
+      description:
+        "Create a versioned Step 1 setup run. Keyed requests replay safely: for each new interactive onboarding, the calling application or agent should generate a fresh clientRequestId UUID internally and reuse it only for an exact retry; never ask the end user for this key. Legacy callers may omit clientRequestId, but unkeyed creation is not retry-safe when IDs are server assigned. founderId and setupRunId are internal runtime IDs: omit both for a new onboarding and never ask an end user to provide them.",
       inputSchema: z.object({
-        founderId: z.string().min(1),
-        setupRunId: z.string().min(1).optional(),
+        clientRequestId: z
+          .uuid()
+          .optional()
+          .describe(
+            "Optional for legacy compatibility. New interactive onboarding must generate a fresh UUID internally, reuse it for exact retries after a lost response, and never request it from an end user.",
+          ),
+        founderId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns founder-*. Never request this ID from an end user.",
+          ),
+        setupRunId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Optional internal runtime ID for backward-compatible replay or integration use. Omit for a new onboarding; the server assigns setup-*. Never request this ID from an end user.",
+          ),
         isSynthetic: IsSyntheticInputSchema,
         acceptMockStorage: AcceptMockStorageSchema,
       }),
       outputSchema: envelopeWithPayload(SetupRunPayloadSchema),
       annotations: WRITE_ANNOTATIONS,
     },
-    async ({ founderId, setupRunId, isSynthetic, acceptMockStorage }) => {
+    async ({ clientRequestId, founderId, setupRunId, isSynthetic, acceptMockStorage }) => {
       let record: ReturnType<BizForgeDataStore["createSetupRun"]> | undefined;
       return safelyWithOrigin(
         () => {
           assertWritePolicy(store, acceptMockStorage, isSynthetic);
           record = store.createSetupRun({
-            founderId,
             isSynthetic,
+            ...(clientRequestId === undefined ? {} : { clientRequestId }),
+            ...(founderId === undefined ? {} : { founderId }),
             ...(setupRunId === undefined ? {} : { setupRunId }),
           });
           return { run: record.value };
@@ -412,13 +432,19 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_transition_founder_setup_run",
     {
       title: "Transition founder setup run",
-      description: "Compare-and-set a setup state with an idempotency key.",
+      description:
+        "Compare-and-set a setup state with an idempotency key. INTERVIEW may transition to INTERVIEW for incremental checkpoints. Supplied stateData replaces the prior object, so read and merge the current stateData before writing a checkpoint.",
       inputSchema: z.object({
         setupRunId: z.string().min(1),
         expectedVersion: z.number().int().positive(),
         targetState: FounderSetupStateSchema,
         idempotencyKey: z.string().min(1),
-        stateData: z.record(z.string(), z.unknown()).optional(),
+        stateData: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Complete replacement for current stateData. For incremental interview checkpoints, merge the latest run.stateData with new answers before calling this tool.",
+          ),
         acceptMockStorage: AcceptMockStorageSchema,
       }),
       outputSchema: envelopeWithPayload(TransitionPayloadSchema),

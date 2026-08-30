@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { flattenClaimSet } from "../domain/claims.js";
 import type { EvidenceItem } from "../domain/evidence.js";
@@ -76,8 +76,9 @@ export interface RequestDeletionInput {
 export interface BizForgeDataStore {
   getDataStatus(): DataStoreStatus;
   createSetupRun(input: {
-    founderId: string;
+    founderId?: string;
     setupRunId?: string;
+    clientRequestId?: string;
     source?: DataSource;
     isSynthetic: boolean;
     now?: string;
@@ -132,6 +133,17 @@ interface IdempotentTransition {
   readonly run: FounderSetupRun;
 }
 
+type IdempotentSetupCreation =
+  | {
+      readonly status: "active";
+      readonly signatureSha256: string;
+      readonly setupRunId: string;
+    }
+  | {
+      readonly status: "deleted";
+      readonly signatureSha256: string;
+    };
+
 interface IdempotentConfirmation {
   readonly signature: string;
   readonly result: ConfirmFounderProfileResult;
@@ -145,7 +157,7 @@ interface IdempotentDeletion {
 const allowedTransitions: Readonly<Record<FounderSetupState, readonly FounderSetupState[]>> = {
   CONSENT_PENDING: ["PUBLIC_EVIDENCE", "INTERVIEW", "DELETION_REQUESTED"],
   PUBLIC_EVIDENCE: ["INTERVIEW", "DELETION_REQUESTED"],
-  INTERVIEW: ["DRAFT_REVIEW", "DELETION_REQUESTED"],
+  INTERVIEW: ["INTERVIEW", "DRAFT_REVIEW", "DELETION_REQUESTED"],
   DRAFT_REVIEW: ["DRAFT_REVIEW", "CONFIRMED", "DELETION_REQUESTED"],
   CONFIRMED: ["REVISION_DRAFT", "DELETION_REQUESTED"],
   REVISION_DRAFT: ["REVISION_DRAFT", "CONFIRMED", "DELETION_REQUESTED"],
@@ -158,6 +170,10 @@ function clone<T>(value: T): T {
 
 function signature(value: unknown): string {
   return JSON.stringify(value);
+}
+
+function signatureSha256(value: unknown): string {
+  return createHash("sha256").update(signature(value)).digest("hex");
 }
 
 function requireRun(
@@ -245,6 +261,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
   >();
   readonly #bundles = new Map<string, StoredResearchBundleRecord<ResearchBundle>>();
   readonly #deletions = new Map<string, StoredRecord<DeletionRecord>>();
+  readonly #creationKeys = new Map<string, IdempotentSetupCreation>();
   readonly #transitionKeys = new Map<string, IdempotentTransition>();
   readonly #confirmationKeys = new Map<string, IdempotentConfirmation>();
   readonly #deletionKeys = new Map<string, IdempotentDeletion>();
@@ -299,18 +316,54 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
   }
 
   createSetupRun(input: {
-    founderId: string;
+    founderId?: string;
     setupRunId?: string;
+    clientRequestId?: string;
     source?: DataSource;
     isSynthetic: boolean;
     now?: string;
   }): StoredRecordWithRun {
-    const setupRunId = input.setupRunId ?? `setup-${randomUUID()}`;
     const requestedSynthetic = input.isSynthetic;
+    const source = input.source ?? "mcp_write";
+    const requestSignatureSha256 = signatureSha256({
+      founderId: input.founderId ?? null,
+      setupRunId: input.setupRunId ?? null,
+      source,
+      isSynthetic: requestedSynthetic,
+      now: input.now ?? null,
+    });
+    if (input.clientRequestId !== undefined) {
+      const replay = this.#creationKeys.get(input.clientRequestId);
+      if (replay !== undefined) {
+        if (replay.status === "deleted") {
+          throw new BizForgeStoreError(
+            "setup_creation_deleted",
+            "This clientRequestId belongs to a deleted setup run and cannot be replayed; use a fresh clientRequestId for intentional re-onboarding",
+          );
+        }
+        if (replay.signatureSha256 !== requestSignatureSha256) {
+          throw new BizForgeStoreError(
+            "idempotency_conflict",
+            "The setup creation clientRequestId was already used with different parameters",
+          );
+        }
+        const replayedRun = this.#runs.get(replay.setupRunId);
+        if (replayedRun === undefined) {
+          throw new BizForgeStoreError(
+            "setup_run_not_found",
+            "The setup run for this clientRequestId no longer exists",
+          );
+        }
+        this.#assertWriteOriginSupported(replayedRun.isSynthetic);
+        return clone(replayedRun);
+      }
+    }
+
     this.#assertWriteOriginSupported(requestedSynthetic);
+    const setupRunId = input.setupRunId ?? `setup-${randomUUID()}`;
     const existing = this.#runs.get(setupRunId);
     if (existing !== undefined) {
-      if (existing.value.founderId !== input.founderId) {
+      if (input.founderId !== undefined && existing.value.founderId !== input.founderId) {
         throw new BizForgeStoreError(
           "setup_run_conflict",
           `Setup run ${setupRunId} already belongs to another founder`,
@@ -322,15 +375,22 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
           `Setup run ${setupRunId} synthetic origin does not match the request`,
         );
       }
+      if (input.clientRequestId !== undefined) {
+        this.#creationKeys.set(input.clientRequestId, {
+          status: "active",
+          signatureSha256: requestSignatureSha256,
+          setupRunId,
+        });
+      }
       return clone(existing);
     }
 
     const now = input.now ?? new Date().toISOString();
-    const source = input.source ?? "mcp_write";
+    const founderId = input.founderId ?? `founder-${randomUUID()}`;
     const value = FounderSetupRunSchema.parse({
       schemaVersion: "1.0.0",
       setupRunId,
-      founderId: input.founderId,
+      founderId,
       state: "CONSENT_PENDING",
       version: 1,
       stateData: {},
@@ -339,6 +399,13 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     });
     const record = { value, ...this.#origin(source, requestedSynthetic) };
     this.#runs.set(setupRunId, record);
+    if (input.clientRequestId !== undefined) {
+      this.#creationKeys.set(input.clientRequestId, {
+        status: "active",
+        signatureSha256: requestSignatureSha256,
+        setupRunId,
+      });
+    }
     return clone(record);
   }
 
@@ -833,6 +900,14 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     for (const idempotencyKey of this.#confirmationKeys.keys()) {
       if (idempotencyKey.startsWith(idempotencyPrefix)) {
         this.#confirmationKeys.delete(idempotencyKey);
+      }
+    }
+    for (const [clientRequestId, creation] of this.#creationKeys) {
+      if (creation.status === "active" && creation.setupRunId === input.setupRunId) {
+        this.#creationKeys.set(clientRequestId, {
+          status: "deleted",
+          signatureSha256: creation.signatureSha256,
+        });
       }
     }
 

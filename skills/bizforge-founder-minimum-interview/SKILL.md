@@ -5,7 +5,7 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, an interactive chat or Generative UI channel, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # BizForge minimum founder interview
@@ -26,6 +26,7 @@ questions, or turning the interview into a personality assessment.
 - A `FounderEvidenceDraft`; it may be empty because profile collection was skipped.
 - Existing founder-confirmed answers and prior interview patches.
 - The active consent status and any correction, revocation, or deletion request.
+- An optional one-line competency or business-interest seed from the opening message.
 
 If consent is revoked or deletion is requested, stop the interview and hand off that request.
 
@@ -43,15 +44,22 @@ applicable mock writes.
 Use `bizforge_put_evidence` to record each retained answer as a canonical `user_input` evidence
 item and `bizforge_get_evidence` to verify that its returned ID resolves. Describe that record as
 durable only when `bizforge_get_data_status` says it is durable. The host or persistence boundary
-must inject authoritative TrueForge session, turn, and input IDs. Never invent those identifiers,
-and never use a sandbox file path as a durable artifact reference.
+may expose authoritative TrueForge session and turn IDs. Use those values only when available;
+never ask the founder for them and never fabricate host metadata. If they are unavailable, use a
+schema-valid non-agent extraction method for the directly normalized self-report or keep the
+answer `session_only`. Never use a sandbox file path as a durable artifact reference.
 
 Use `bizforge_get_founder_setup_run` to load current evidence/interview state and
-`bizforge_transition_founder_setup_run` to atomically persist each `FounderInterviewPatch` with
-`setupRunId`, expected version, and an idempotency key. The patch is conceptual and transition
-`stateData` is currently untyped; apply this skill's output and acceptance checks before calling
-the tool and do not claim that the MCP validated the patch shape. Never blindly retry an
-ambiguous transition or reconstruct missing persisted state from conversation memory.
+retain the returned internal IDs without asking the founder for them. After each answered group,
+merge the new normalized values and evidence IDs into the complete previously persisted patch,
+then use `bizforge_transition_founder_setup_run` for an `INTERVIEW -> INTERVIEW` checkpoint with
+the current version and a sandbox-generated opaque idempotency key. A transition replaces
+`stateData`; sending only the latest answer would erase prior interview state. When
+`readyForDraft` is true, send the complete merged patch in the single `INTERVIEW -> DRAFT_REVIEW`
+transition. The patch is conceptual and transition `stateData` is currently untyped; apply this
+skill's output and acceptance checks before calling the tool and do not claim that the MCP
+validated the patch shape. Never blindly retry an ambiguous transition or reconstruct missing
+persisted state from conversation memory.
 
 Before durably persisting any answer—even on the interview-only branch—explain and use
 `bizforge_record_consent` to record separate consent scopes for
@@ -77,6 +85,21 @@ Before asking anything, classify each required field as:
 - `declined` — the founder prefers not to answer.
 
 Never re-ask a confirmed field. Never infer appetite or tolerance values from profile evidence.
+
+## Start naturally from a one-line seed
+
+If the opening message is only a phrase such as `workflow and operations automation`, record it
+as a candidate competency after the consent gate and begin the interview. Do not ask the founder
+to restate it in a schema, provide IDs, or supply the rest of the profile at once. Ask for the
+candidate competency's self-assessed level and optional years of experience, then gather the
+missing business preferences in compact conversational groups. The short seed does not imply a
+name, budget, availability, target revenue date, team size, offer model, customer segment, sales
+tolerance, risk tolerance, regulatory tolerance, exclusions, or access advantage.
+
+Keep each turn easy to answer: normally ask one coherent group with no more than four related
+values, accept natural-language replies, normalize them, recompute the gap map, and move to the
+next missing group. Never expose MCP field names or internal record identifiers in a
+founder-facing question.
 
 ## Question policy
 
