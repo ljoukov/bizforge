@@ -23,6 +23,21 @@ The Bright Data ingestion adapter is the next implementation slice.
 
 ![The agent connects the dots](docs/images/agent-scraping/05-business-opportunity.png)
 
+## Architecture diagrams
+
+These diagrams show the current local architecture and the planned Bright Data collection
+boundary. Solid arrows are working paths; the dashed amber path is the next implementation slice.
+
+![How the BizForge components fit together](docs/images/architecture-excalidraw/01-how-bizforge-fits-together.png)
+
+![How the agent sets the research scope](docs/images/architecture-excalidraw/02-agent-research-scope.png)
+
+![The planned Bright Data collection boundary](docs/images/architecture-excalidraw/03-bright-data-boundary.png)
+
+![How web pages become trusted facts](docs/images/architecture-excalidraw/04-web-pages-to-evidence.png)
+
+![How founders explore saved results safely](docs/images/architecture-excalidraw/05-read-only-exploration.png)
+
 ## Workflow
 
 BizForge is designed as three stages:
