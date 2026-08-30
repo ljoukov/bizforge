@@ -112,6 +112,12 @@ describe("BizForge MCP HTTP server", () => {
         `${tool.name} must expose an explicit payload output schema`,
       ).toBeGreaterThan(0);
     }
+    const growthOutputSchema = listed.tools.find(
+      ({ name }) => name === "bizforge_get_growth_chart_data",
+    )?.outputSchema;
+    expect(growthOutputSchema).toBeDefined();
+    expect(JSON.stringify(growthOutputSchema)).not.toContain('"prefixItems"');
+    expect(JSON.stringify(growthOutputSchema)).not.toContain('"items":false');
 
     const status = await client.callTool({ name: "bizforge_get_data_status", arguments: {} });
     expect(asObject(status.structuredContent)).toMatchObject({

@@ -83,10 +83,15 @@ const EligibleGrowthProjectionSchema = z.object({
   metric: z.string(),
   unit: z.string(),
   direction: z.literal("rising"),
-  series: z.tuple([
-    z.object({ label: z.literal("Baseline"), window: DateRangeSchema, value: z.number() }),
-    z.object({ label: z.literal("Current"), window: DateRangeSchema, value: z.number() }),
-  ]),
+  series: z
+    .array(
+      z.object({
+        label: z.enum(["Baseline", "Current"]),
+        window: DateRangeSchema,
+        value: z.number(),
+      }),
+    )
+    .length(2),
   absoluteChange: z.number(),
   percentageChange: z.number(),
   sampleSize: z.number().int().nonnegative(),
