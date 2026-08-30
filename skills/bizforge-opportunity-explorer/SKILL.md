@@ -29,7 +29,10 @@ skill when the user asks for a chart, interactive comparison, challenge, or sens
 
 Call `bizforge_get_data_status` first. Then use only these BizForge MCP read tools:
 
-- `bizforge_get_latest_research_bundle` when no bundle ID was supplied;
+- `bizforge_get_latest_research_bundle({})` when no bundle ID or founder ID was supplied. Omit
+  `founderId` for the global latest bundle; never send `"*"`, `"all"`, `"latest"`, or another
+  invented selector. Supply `founderId` only when the user or an earlier canonical MCP record
+  provided the exact ID;
 - `bizforge_get_research_bundle` for a specific bundle ID/version;
 - `bizforge_get_confirmed_founder_profile` for the exact snapshot ID embedded in the bundle;
 - `bizforge_list_opportunities` for a compact index;

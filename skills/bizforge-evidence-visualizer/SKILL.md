@@ -23,7 +23,8 @@ author the final interface.
 
 Call `bizforge_get_data_status` first. Read source data only through:
 
-- `bizforge_get_latest_research_bundle` or `bizforge_get_research_bundle`;
+- `bizforge_get_latest_research_bundle({})` or `bizforge_get_research_bundle`. For global latest,
+  pass an empty object and never invent a wildcard founder ID;
 - `bizforge_get_confirmed_founder_profile` for the bundle's exact snapshot ID;
 - `bizforge_list_opportunities` and `bizforge_get_opportunity`;
 - `bizforge_get_market_signals`;

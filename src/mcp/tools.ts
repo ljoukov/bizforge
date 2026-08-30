@@ -718,8 +718,15 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_get_latest_research_bundle",
     {
       title: "Get latest research bundle",
-      description: "Read the latest bundle globally or for one founder.",
-      inputSchema: z.object({ founderId: z.string().min(1).optional() }),
+      description:
+        "Read the latest bundle globally by calling with an empty object, or supply one exact founderId. Wildcards and global selector strings are not supported.",
+      inputSchema: z.object({
+        founderId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Exact founder ID. Omit this field for the global latest bundle."),
+      }),
       outputSchema: envelopeWithPayload(z.object({ bundle: ResearchBundleSchema })),
       annotations: READ_ONLY_ANNOTATIONS,
     },

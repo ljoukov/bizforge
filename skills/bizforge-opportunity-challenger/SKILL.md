@@ -19,7 +19,8 @@ The output is a reversible analytical view, never a rewrite of the source artifa
 ## Read-only evidence boundary
 
 Call `bizforge_get_data_status`, then pin the requested bundle with
-`bizforge_get_latest_research_bundle` or `bizforge_get_research_bundle`. Use
+`bizforge_get_latest_research_bundle({})` or `bizforge_get_research_bundle`. For global latest,
+pass an empty object and never invent a wildcard founder ID. Use
 `bizforge_get_confirmed_founder_profile` only for the exact snapshot ID embedded in that bundle,
 and use `bizforge_list_opportunities`, `bizforge_get_opportunity`,
 `bizforge_get_market_signals`, `bizforge_get_growth_chart_data`, and `bizforge_get_evidence` for
