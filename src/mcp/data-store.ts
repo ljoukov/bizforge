@@ -68,7 +68,6 @@ export interface ConfirmFounderProfileResult {
   readonly profile: StoredFounderProfileRecord<ConfirmedFounderProfileSnapshot>;
   readonly run: FounderSetupRun;
   readonly stage2HandoffEligible: boolean;
-  readonly mockStep2DemoEligible: boolean;
   readonly replayed: boolean;
 }
 
@@ -232,7 +231,6 @@ const ConfirmationResultSchema = z
     profile: StoredProfileSchema,
     run: FounderSetupRunSchema,
     stage2HandoffEligible: z.boolean(),
-    mockStep2DemoEligible: z.boolean(),
     replayed: z.boolean(),
   })
   .strict();
@@ -1012,21 +1010,10 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
   #historyCleanupGeneration = 0;
   #historyCleanupCompletedGeneration = 0;
   readonly #dataStatus: DataStoreStatus;
-  readonly #researchBundleFactory:
-    | ((
-        profile: ConfirmedFounderProfileSnapshot,
-        founderEvidence: readonly EvidenceItem[],
-      ) => ResearchBundle)
-    | undefined;
 
   constructor(options?: {
-    researchBundleFactory?: (
-      profile: ConfirmedFounderProfileSnapshot,
-      founderEvidence: readonly EvidenceItem[],
-    ) => ResearchBundle;
     dataStatus?: DataStoreStatus;
   }) {
-    this.#researchBundleFactory = options?.researchBundleFactory;
     this.#dataStatus = DataStoreStatusSchema.parse(options?.dataStatus ?? mockDataStatus());
   }
 
@@ -1593,10 +1580,9 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
 
   #confirmationEligibility(
     setupRunId: string,
-    isSynthetic: boolean,
     snapshotId: string,
     prospectiveCanonical = false,
-  ): Pick<ConfirmFounderProfileResult, "stage2HandoffEligible" | "mockStep2DemoEligible"> {
+  ): Pick<ConfirmFounderProfileResult, "stage2HandoffEligible"> {
     const canonicalSnapshotId = this.#currentProfileSnapshotIds.get(setupRunId);
     const isCanonical = prospectiveCanonical || canonicalSnapshotId === snapshotId;
     const downstreamConsentActive =
@@ -1605,7 +1591,6 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     const isMockStore = this.getDataStatus().isMock;
     return {
       stage2HandoffEligible: !isMockStore && isCanonical && downstreamConsentActive,
-      mockStep2DemoEligible: isMockStore && isSynthetic && isCanonical && downstreamConsentActive,
     };
   }
 
@@ -1709,7 +1694,6 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       }
       const liveEligibility = this.#confirmationEligibility(
         input.setupRunId,
-        replay.result.profile.isSynthetic,
         replay.result.profile.value.snapshotId,
       );
       const currentResult = { ...replay.result, ...liveEligibility, replayed: false };
@@ -1780,30 +1764,14 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
         `Confirmed snapshot ${profile.snapshotId} is immutable and already exists`,
       );
     }
-    const founderEvidence = profile.sourceEvidenceIds.map((evidenceId) => {
-      const evidence = this.#evidence.get(evidenceId);
-      if (evidence === undefined) {
-        throw new BizForgeStoreError(
-          "evidence_not_found",
-          `Founder evidence ${evidenceId} is missing`,
-        );
-      }
-      return evidence.value;
-    });
-    const { stage2HandoffEligible, mockStep2DemoEligible } = this.#confirmationEligibility(
+    // Every evidence reference has already been verified against this setup run
+    // and origin above. Research bundles are persisted through their explicit
+    // write boundary after profile confirmation.
+    const { stage2HandoffEligible } = this.#confirmationEligibility(
       input.setupRunId,
-      input.isSynthetic,
       profile.snapshotId,
       true,
     );
-    const generatedBundle =
-      mockStep2DemoEligible && this.#researchBundleFactory !== undefined
-        ? this.#researchBundleFactory(profile, founderEvidence)
-        : undefined;
-    if (generatedBundle !== undefined) {
-      ResearchBundleSchema.parse(generatedBundle);
-      assertResearchBundleEvidenceValid(generatedBundle);
-    }
 
     const checkpoint = {
       runs: new Map(this.#runs),
@@ -1841,12 +1809,8 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
         profile: storedProfile,
         run: transition.run,
         stage2HandoffEligible,
-        mockStep2DemoEligible,
         replayed: false,
       };
-      if (generatedBundle !== undefined) {
-        this.saveResearchBundle(generatedBundle, input.source ?? "mcp_write", input.isSynthetic);
-      }
       this.#confirmationKeys.set(key, {
         status: "replayable",
         signatureSha256: requestSignatureSha256,

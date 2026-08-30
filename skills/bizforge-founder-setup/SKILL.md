@@ -47,7 +47,7 @@ ordinary healthy onboarding replies, do not narrate the backend, storage mode, r
 MCP source fields, or implementation names. Surface infrastructure only when degraded, when a
 write fails, or when the founder explicitly asks. If durable persistence is unavailable, fail
 closed before collecting profile data and ask the founder to try again after the service is
-restored.
+restored. Do not offer an alternate storage or test mode.
 
 Verify the public-profile connector only if the founder requests profile enrichment and the MCP
 reports healthy persistent storage. Never use the temporary TrueForge sandbox as the durable store

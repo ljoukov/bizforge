@@ -1,8 +1,8 @@
-import type { EvidenceItem } from "../domain/evidence.js";
-import type { ConfirmedFounderProfileSnapshot } from "../domain/founder-profile.js";
-import { ResearchBundleSchema, type ResearchBundle } from "../domain/research-bundle.js";
-import type { BizForgeDataStore } from "./data-store.js";
-import { canonicalContentSha256 } from "./integrity.js";
+import type { EvidenceItem } from "../../src/domain/evidence.js";
+import type { ConfirmedFounderProfileSnapshot } from "../../src/domain/founder-profile.js";
+import { type ResearchBundle, ResearchBundleSchema } from "../../src/domain/research-bundle.js";
+import { type BizForgeDataStore, InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
+import { canonicalContentSha256 } from "../../src/mcp/integrity.js";
 
 const confidence = {
   lower: 0.55,
@@ -371,7 +371,7 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
     targetState: "DRAFT_REVIEW",
     idempotencyKey: "seed-review",
   });
-  store.confirmFounderProfile({
+  const confirmed = store.confirmFounderProfile({
     setupRunId,
     expectedVersion: 3,
     idempotencyKey: "seed-confirm",
@@ -414,4 +414,15 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
       confirmedAt,
     },
   });
+  store.saveResearchBundle(
+    buildSyntheticResearchBundle(confirmed.profile.value, [evidence]),
+    "mock_seed",
+    true,
+  );
+}
+
+export function createSeededBizForgeDataStore(): InMemoryBizForgeDataStore {
+  const store = new InMemoryBizForgeDataStore();
+  seedSyntheticMockData(store);
+  return store;
 }

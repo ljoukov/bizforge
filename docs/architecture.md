@@ -13,12 +13,10 @@ Stage 1 setup agent
        -> Stage 3 reads the exact bundle version through read-only MCP projections
 ```
 
-`BizForgeDataStore` separates persistence from protocol and domain validation. The first adapter
-is an in-memory, synthetic demo store. Publishing an explicitly synthetic founder snapshot in
-that mode deterministically produces a mock ResearchBundle tied to the same snapshot, exercising
-the real contracts while Stage 2 collection is not yet connected. The production follow-up will
-replace that adapter with SQLite; mock/persisted data mode remains separate from memory/SQLite
-storage backend so a fixture can never be mistaken for evidence.
+`BizForgeDataStore` separates persistence from protocol and domain validation. The production
+adapter is SQLite, and every configured MCP runtime opens a persistent SQLite database. Synthetic
+builders and in-memory stores are limited to test fixtures and are not exported by the production
+server or package entrypoint.
 
 The MCP endpoint uses Streamable HTTP on loopback with Host/Origin validation. Step 1 receives
 the setup, consent, evidence, confirmation and deletion tools; Step 2 receives the bundle write
@@ -89,8 +87,8 @@ configuration and must not enter prompts, artifacts, logs or sandbox files.
 Personal profile ingestion requires consent. Persist the confirmed, minimized founder snapshot;
 do not retain fields that the research workflow does not need.
 
-The in-memory demo is not durable. Real founder profile collection stays disabled/session-only in
-mock mode; only explicitly synthetic demo snapshots may exercise the downstream handoff.
+Founder setup records, minimized evidence and confirmed snapshots are stored in SQLite. The local
+database and its backups require the same access controls as the founder data they contain.
 
 ## Scarcity workflow
 

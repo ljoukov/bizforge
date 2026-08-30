@@ -1,11 +1,9 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { McpServer, ResourceTemplate, createMcpHandler } from "@modelcontextprotocol/server";
+import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 
 import type { BizForgeDataStore } from "./data-store.js";
-import { InMemoryBizForgeDataStore } from "./data-store.js";
-import { buildSyntheticResearchBundle, seedSyntheticMockData } from "./mock-data.js";
 import { SqliteBizForgeDataStore } from "./sqlite-data-store.js";
 import { createResponseEnvelope, registerBizForgeTools } from "./tools.js";
 
@@ -157,28 +155,14 @@ export function createBizForgeMcpServer(store: BizForgeDataStore): McpServer {
   return server;
 }
 
-export function createSeededBizForgeDataStore(): InMemoryBizForgeDataStore {
-  const store = new InMemoryBizForgeDataStore({
-    researchBundleFactory: buildSyntheticResearchBundle,
-  });
-  seedSyntheticMockData(store);
-  return store;
-}
-
 /**
- * Creates the configured runtime store only when called. Live MCP processes use
- * persistent SQLite by default; mock storage is an explicit demo-only opt-in.
+ * Creates the persistent runtime store only when called. Live MCP processes
+ * always use SQLite; in-memory fixtures are restricted to tests.
  */
 export function createConfiguredBizForgeDataStore(
   configuration: BizForgeDataStoreConfiguration = {},
 ): BizForgeDataStore {
   const environment = configuration.environment ?? process.env;
-  const storageMode = environment.BIZFORGE_STORAGE_MODE ?? "sqlite";
-  if (storageMode === "mock") return createSeededBizForgeDataStore();
-  if (storageMode !== "sqlite") {
-    throw new Error('BIZFORGE_STORAGE_MODE must be either "sqlite" or "mock"');
-  }
-
   const configuredPath = environment.BIZFORGE_DB_PATH ?? DEFAULT_DATABASE_PATH;
   if (configuredPath.trim().length === 0) {
     throw new Error("BIZFORGE_DB_PATH must not be empty");

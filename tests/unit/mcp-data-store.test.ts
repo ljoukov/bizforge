@@ -8,10 +8,10 @@ import {
   type DataStoreStatus,
 } from "../../src/mcp/contracts.js";
 import { BizForgeStoreError, InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
-import { buildSyntheticResearchBundle, seedSyntheticMockData } from "../../src/mcp/mock-data.js";
+import { buildSyntheticResearchBundle, seedSyntheticMockData } from "../fixtures/mock-data.js";
 
 function makeStore() {
-  return new InMemoryBizForgeDataStore({ researchBundleFactory: buildSyntheticResearchBundle });
+  return new InMemoryBizForgeDataStore();
 }
 
 function persistentDataStatus(): DataStoreStatus {
@@ -607,7 +607,7 @@ describe("InMemoryBizForgeDataStore", () => {
     );
   });
 
-  it("publishes a synthetic profile, keeps production handoff false, and regenerates Step 2", () => {
+  it("publishes a synthetic profile without generating research and saves a bundle explicitly", () => {
     const store = makeStore();
     const prepared = prepareConfirmation(store);
     const input = {
@@ -620,7 +620,6 @@ describe("InMemoryBizForgeDataStore", () => {
     const result = store.confirmFounderProfile(input);
     expect(result).toMatchObject({
       stage2HandoffEligible: false,
-      mockStep2DemoEligible: true,
       replayed: false,
       run: { state: "CONFIRMED", version: 4 },
     });
@@ -634,20 +633,21 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(store.getFounderProfile(prepared.profile.snapshotId)?.value).toEqual(prepared.profile);
     expect(store.getFounderProfile("missing")).toBeUndefined();
 
-    const generated = store.getLatestResearchBundle(prepared.founderId);
-    expect(generated?.value.founderProfile).toEqual(prepared.profile);
-    expect(generated?.value.opportunities[0]?.founderProfileSnapshotId).toBe(
+    expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
+    const bundle = buildSyntheticResearchBundle(prepared.profile, [prepared.evidence]);
+    const saved = store.saveResearchBundle(bundle, "mcp_write", true);
+    expect(saved.value.founderProfile).toEqual(prepared.profile);
+    expect(saved.value.opportunities[0]?.founderProfileSnapshotId).toBe(
       prepared.profile.snapshotId,
     );
-    expect(generated?.isSynthetic).toBe(true);
-    if (generated === undefined) throw new Error("expected generated bundle");
-    expect(store.saveResearchBundle(generated.value, "mcp_write", true)).toEqual(generated);
-    expect(() => store.saveResearchBundle(generated.value, "mcp_write", false)).toThrow(
+    expect(saved.isSynthetic).toBe(true);
+    expect(store.saveResearchBundle(bundle, "mcp_write", true)).toEqual(saved);
+    expect(() => store.saveResearchBundle(bundle, "mcp_write", false)).toThrow(
       /synthetic records only/,
     );
   });
 
-  it("uses only the newest consent event and does not synthesize research after revocation", () => {
+  it("uses only the newest consent event and keeps research handoff disabled after revocation", () => {
     const retentionStore = makeStore();
     const retention = prepareConfirmation(retentionStore, {
       setupRunId: "setup-retention-revoked",
@@ -700,9 +700,15 @@ describe("InMemoryBizForgeDataStore", () => {
     });
     expect(result).toMatchObject({
       stage2HandoffEligible: false,
-      mockStep2DemoEligible: false,
       run: { state: "CONFIRMED" },
     });
+    expect(() =>
+      researchStore.saveResearchBundle(
+        buildSyntheticResearchBundle(research.profile, [research.evidence]),
+        "mcp_write",
+        true,
+      ),
+    ).toThrow(/use_confirmed_founder_snapshot_for_research/);
     expect(researchStore.getLatestResearchBundle(research.founderId)).toBeUndefined();
   });
 
@@ -714,7 +720,6 @@ describe("InMemoryBizForgeDataStore", () => {
         restoredStore: makeStore(),
         isSynthetic: true,
         initialStage2Eligibility: false,
-        initialMockEligibility: true,
       },
       {
         name: "persistent",
@@ -722,7 +727,6 @@ describe("InMemoryBizForgeDataStore", () => {
         restoredStore: makePersistentStore(),
         isSynthetic: false,
         initialStage2Eligibility: true,
-        initialMockEligibility: false,
       },
     ]) {
       const prepared = prepareConfirmation(
@@ -743,7 +747,6 @@ describe("InMemoryBizForgeDataStore", () => {
       };
       expect(scenario.store.confirmFounderProfile(input)).toMatchObject({
         stage2HandoffEligible: scenario.initialStage2Eligibility,
-        mockStep2DemoEligible: scenario.initialMockEligibility,
         replayed: false,
       });
       scenario.store.recordConsent({
@@ -760,14 +763,12 @@ describe("InMemoryBizForgeDataStore", () => {
 
       expect(scenario.store.confirmFounderProfile(input)).toMatchObject({
         stage2HandoffEligible: false,
-        mockStep2DemoEligible: false,
         replayed: true,
       });
 
       scenario.restoredStore.restoreSnapshot(snapshotWithStaleCachedEligibility);
       expect(scenario.restoredStore.confirmFounderProfile(input)).toMatchObject({
         stage2HandoffEligible: false,
-        mockStep2DemoEligible: false,
         replayed: true,
       });
     }
@@ -869,8 +870,11 @@ describe("InMemoryBizForgeDataStore", () => {
       profile: withdrawnProfile,
     } as const;
     store.confirmFounderProfile(confirmationInput);
-    const bundle = store.getLatestResearchBundle(prepared.founderId);
-    if (bundle === undefined) throw new Error("expected generated research bundle");
+    const bundle = store.saveResearchBundle(
+      buildSyntheticResearchBundle(withdrawnProfile, [prepared.evidence]),
+      "mcp_write",
+      true,
+    );
     const opportunityId = bundle.value.opportunities[0]?.opportunityId;
     if (opportunityId === undefined) throw new Error("expected generated opportunity");
 
@@ -1302,6 +1306,11 @@ describe("InMemoryBizForgeDataStore", () => {
       profile: oldProfile,
     } as const;
     store.confirmFounderProfile(oldConfirmation);
+    store.saveResearchBundle(
+      buildSyntheticResearchBundle(oldProfile, [prepared.evidence]),
+      "mcp_write",
+      true,
+    );
     const revisionTransition = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 4,
@@ -1325,6 +1334,11 @@ describe("InMemoryBizForgeDataStore", () => {
       profile: currentProfile,
     } as const;
     store.confirmFounderProfile(currentConfirmation);
+    store.saveResearchBundle(
+      buildSyntheticResearchBundle(currentProfile, [currentEvidence]),
+      "mcp_write",
+      true,
+    );
 
     expect(store.getFounderProfile(oldProfile.snapshotId)).toBeUndefined();
     expect(store.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
@@ -1582,7 +1596,6 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(restored.confirmFounderProfile(oldConfirmation)).toMatchObject({
       replayed: true,
       stage2HandoffEligible: false,
-      mockStep2DemoEligible: false,
     });
     expect(() =>
       restored.saveResearchBundle(
@@ -1622,7 +1635,7 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(restarted.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
   });
 
-  it("rolls back profile, run, bundle, evidence, and idempotency state on confirmation failure", () => {
+  it("keeps confirmation independent from a later atomic bundle-save failure", () => {
     const store = makeStore();
     const prepared = prepareConfirmation(store, {
       setupRunId: "setup-atomic",
@@ -1640,28 +1653,31 @@ describe("InMemoryBizForgeDataStore", () => {
       "mcp_write",
       true,
     );
-    expect(() =>
-      store.confirmFounderProfile({
-        setupRunId: prepared.setupRunId,
-        expectedVersion: 3,
-        idempotencyKey: "atomic",
-        isSynthetic: true,
-        profile: prepared.profile,
-      }),
-    ).toThrow(/already exists with different content/);
-    expect(store.getFounderProfile(prepared.profile.snapshotId)).toBeUndefined();
+    const confirmation = store.confirmFounderProfile({
+      setupRunId: prepared.setupRunId,
+      expectedVersion: 3,
+      idempotencyKey: "atomic",
+      isSynthetic: true,
+      profile: prepared.profile,
+    });
+    expect(confirmation).toMatchObject({ run: { state: "CONFIRMED", version: 4 } });
+    expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
+    expect(() => store.saveResearchBundle(generated, "mcp_write", true)).toThrow(
+      /already exists with different content/,
+    );
+    expect(store.getFounderProfile(prepared.profile.snapshotId)?.value).toEqual(prepared.profile);
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
     expect(store.getSetupRun(prepared.setupRunId)?.value).toMatchObject({
-      state: "DRAFT_REVIEW",
-      version: 3,
+      state: "CONFIRMED",
+      version: 4,
     });
     expect(
       store.exportSnapshot().transitionKeys.some(([key]) => key.endsWith(":confirm:atomic")),
-    ).toBe(false);
+    ).toBe(true);
     expect(() =>
       store.transitionSetupRun({
         setupRunId: prepared.setupRunId,
-        expectedVersion: 3,
+        expectedVersion: 4,
         targetState: "CONFIRMED",
         idempotencyKey: "confirm:atomic",
         stateData: { confirmedSnapshotId: prepared.profile.snapshotId },
@@ -1890,6 +1906,11 @@ describe("InMemoryBizForgeDataStore", () => {
       profile: prepared.profile,
     } as const;
     store.confirmFounderProfile(confirmationInput);
+    store.saveResearchBundle(
+      buildSyntheticResearchBundle(prepared.profile, [prepared.evidence]),
+      "mcp_write",
+      true,
+    );
     expect(() =>
       store.requestDeletion({
         setupRunId: prepared.setupRunId,

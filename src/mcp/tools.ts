@@ -49,7 +49,7 @@ const DataStatusPayloadSchema = DataStoreStatusSchema.extend({
   domainSchemaVersion: z.literal("1.0.0"),
   capabilities: z.object({
     step1Writes: z.boolean(),
-    mockStep2Synthesis: z.boolean(),
+    step2ResearchHandoff: z.boolean(),
     step3ReadProjections: z.boolean(),
     growthChartProjection: z.boolean(),
     buyerEvidenceProjection: z.boolean(),
@@ -118,7 +118,6 @@ const GrowthProjectionCoreSchema = z.object({
 });
 
 const EligibleGrowthProjectionSchema = GrowthProjectionCoreSchema.extend({
-  demoEligible: z.boolean(),
   inferenceStatus: z.enum(["synthetic_evidence_backed_inference", "evidence_backed_inference"]),
 });
 
@@ -171,14 +170,6 @@ const SavedProfilePayloadSchema = z.object({
   run: FounderSetupRunSchema,
   replayed: z.boolean(),
   stage2HandoffEligible: z.boolean(),
-  mockStep2DemoEligible: z.boolean(),
-  mockStep2Bundle: z
-    .object({
-      bundleId: z.string(),
-      bundleVersion: z.number().int().positive(),
-      founderProfileSnapshotId: z.string(),
-    })
-    .nullable(),
 });
 const PersistentSavedProfilePayloadSchema = z.object({
   snapshotId: z.string(),
@@ -195,7 +186,7 @@ type EnvelopeOptions = {
 };
 
 const syntheticWarning =
-  "Synthetic fixtures demonstrate product behavior only and are not real market or buyer evidence.";
+  "Synthetic fixtures are for testing only and are not real market or buyer evidence.";
 
 export function createResponseEnvelope(
   payload: unknown,
@@ -393,7 +384,6 @@ function projectGrowth(signal: MarketSignal, isSynthetic: boolean, exposeDataMod
   return exposeDataMode
     ? {
         ...projection,
-        demoEligible: isSynthetic,
         inferenceStatus: isSynthetic
           ? ("synthetic_evidence_backed_inference" as const)
           : projection.inferenceStatus,
@@ -423,6 +413,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
       const status = store.getDataStatus();
       const capabilities = {
         step1Writes: true,
+        step2ResearchHandoff: true,
         step3ReadProjections: true,
         growthChartProjection: true,
         buyerEvidenceProjection: false,
@@ -435,10 +426,7 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
         ? {
             ...status,
             domainSchemaVersion: "1.0.0" as const,
-            capabilities: {
-              ...capabilities,
-              mockStep2Synthesis: true,
-            },
+            capabilities,
           }
         : {
             persistenceReady,
@@ -725,9 +713,8 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
     "bizforge_save_confirmed_founder_profile",
     {
       title: "Save confirmed founder profile",
-      description: mockMode
-        ? "Validate and immutably publish a founder snapshot; mock adapters may synthesize clearly labeled demo Step 2 data."
-        : "Validate and immutably publish a confirmed founder snapshot for downstream work.",
+      description:
+        "Validate and immutably publish a confirmed founder snapshot for downstream work.",
       inputSchema: mockMode
         ? z.object({
             setupRunId: z.string().min(1),
@@ -768,9 +755,6 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
           assertWritePolicy(store, acceptMockStorage, input.isSynthetic);
           const result = store.confirmFounderProfile(input);
           profileOrigin = result.profile;
-          const generated = result.mockStep2DemoEligible
-            ? store.getLatestResearchBundle(input.profile.founderId)
-            : undefined;
           if (result.run.state !== "CONFIRMED") {
             throw new Error("Confirmed profile save returned an invalid setup state");
           }
@@ -785,15 +769,6 @@ export function registerBizForgeTools(server: McpServer, store: BizForgeDataStor
                 run: result.run,
                 replayed: result.replayed,
                 stage2HandoffEligible: result.stage2HandoffEligible,
-                mockStep2DemoEligible: result.mockStep2DemoEligible,
-                mockStep2Bundle:
-                  generated === undefined
-                    ? null
-                    : {
-                        bundleId: generated.value.bundleId,
-                        bundleVersion: generated.value.bundleVersion,
-                        founderProfileSnapshotId: generated.value.founderProfile.snapshotId,
-                      },
               }
             : persistentConfirmation;
         },

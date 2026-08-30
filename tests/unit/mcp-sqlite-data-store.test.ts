@@ -11,8 +11,8 @@ import type { ConfirmedFounderProfileSnapshot } from "../../src/domain/founder-p
 import { type ResearchBundle, ResearchBundleSchema } from "../../src/domain/research-bundle.js";
 import type { BizForgeStoreError } from "../../src/mcp/data-store.js";
 import { canonicalContentSha256 } from "../../src/mcp/integrity.js";
-import { buildSyntheticResearchBundle } from "../../src/mcp/mock-data.js";
 import { SqliteBizForgeDataStore } from "../../src/mcp/sqlite-data-store.js";
+import { buildSyntheticResearchBundle } from "../fixtures/mock-data.js";
 
 const timestamp = "2026-08-29T12:00:00.000Z";
 const temporaryDirectories: string[] = [];
@@ -231,7 +231,6 @@ describe("SqliteBizForgeDataStore", () => {
 
     expect(prepared.confirmation).toMatchObject({
       stage2HandoffEligible: true,
-      mockStep2DemoEligible: false,
       replayed: false,
       profile: {
         isMock: false,

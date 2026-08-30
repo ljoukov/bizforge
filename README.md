@@ -33,7 +33,6 @@ The current implementation establishes the contracts and safety rails for all th
 - research-bundle validation;
 - a loopback Streamable HTTP MCP server shared by all three stages;
 - a persistent SQLite data-store adapter for founder setup, evidence and research bundles;
-- an explicitly selected, seeded in-memory adapter for isolated demo and test flows;
 - three read-only exploration skills for evidence, Generative UI charts and skeptical review;
 - provider ports, plus a headless TrueForge session/turn adapter; the Bright Data adapter follows
   in the ingestion PR;
@@ -59,7 +58,7 @@ npm run check
 production build. Tests use isolated temporary databases or prepared records and do not require
 API keys.
 
-### Local MCP demo
+### Local MCP server
 
 The MCP endpoint is intentionally local and unauthenticated. It binds to `127.0.0.1:8791`,
 applies localhost Host/Origin validation, and exposes `/mcp` plus `/healthz`:
@@ -72,17 +71,13 @@ npm run mcp:start
 Both MCP scripts load `.env` when it exists. Values already present in the process environment
 take precedence, so one-off overrides such as the command below continue to work.
 
-The live MCP uses persistent SQLite by default. Unless configured otherwise, it creates
+The live MCP always uses persistent SQLite. Unless configured otherwise, it creates
 `.data/bizforge.sqlite` under the directory where the process starts. To select another local
 file, set `BIZFORGE_DB_PATH`; relative paths are resolved from that same working directory:
 
 ```bash
 BIZFORGE_DB_PATH=/private/path/bizforge.sqlite npm run mcp:serve
 ```
-
-The seeded, ephemeral in-memory fixture remains available only through the explicit
-`BIZFORGE_STORAGE_MODE=mock` setting. The SQLite and mock adapters implement the same
-`BizForgeDataStore` boundary, so MCP tool inputs and outputs do not change with the backend.
 
 ### Local profile-data privacy
 
@@ -102,7 +97,6 @@ Local credentials belong only in `.env`:
 - `BRIGHT_DATA_API_KEY`
 - `DAYTONA_API_KEY`
 - optional TrueForge connection settings
-- `BIZFORGE_STORAGE_MODE` (`sqlite` by default; `mock` only for the seeded demo fixture)
 - `BIZFORGE_DB_PATH` (local SQLite path, default `.data/bizforge.sqlite`)
 
 Never commit `.env`, SQLite/WAL files, raw provider responses containing personal data, or runtime

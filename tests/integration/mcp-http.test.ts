@@ -6,13 +6,16 @@ import { join } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { EvidenceItemSchema } from "../../src/domain/evidence.js";
+import { ConfirmedFounderProfileSnapshotSchema } from "../../src/domain/founder-profile.js";
 import type { BizForgeDataStore } from "../../src/mcp/data-store.js";
 import { createBizForgeHttpServer, listenForBizForgeMcp } from "../../src/mcp/http-server.js";
-import {
-  createConfiguredBizForgeDataStore,
-  createSeededBizForgeDataStore,
-} from "../../src/mcp/server.js";
+import { createConfiguredBizForgeDataStore } from "../../src/mcp/server.js";
 import { SqliteBizForgeDataStore } from "../../src/mcp/sqlite-data-store.js";
+import {
+  buildSyntheticResearchBundle,
+  createSeededBizForgeDataStore,
+} from "../fixtures/mock-data.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -56,7 +59,7 @@ describe("BizForge MCP HTTP server", () => {
     await Promise.all(cleanup.splice(0).map((close) => close()));
   });
 
-  it("serves the complete synthetic Step 1 -> mock Step 2 -> Step 3 flow", async () => {
+  it("serves the complete synthetic Step 1 -> Step 2 -> Step 3 flow", async () => {
     const { server, baseUrl } = await startServer();
     const client = new Client({ name: "bizforge-test", version: "1.0.0" });
     const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
@@ -152,7 +155,11 @@ describe("BizForge MCP HTTP server", () => {
       ephemeral: true,
     });
     expect(payloadOf(status)).toMatchObject({
-      capabilities: { buyerEvidenceProjection: false, opportunityRerank: false },
+      capabilities: {
+        step2ResearchHandoff: true,
+        buyerEvidenceProjection: false,
+        opportunityRerank: false,
+      },
     });
     const missingMockAcceptance = await client.callTool({
       name: "bizforge_create_founder_setup_run",
@@ -491,10 +498,14 @@ describe("BizForge MCP HTTP server", () => {
       }),
     );
     expect(published).toMatchObject({
+      profile: { snapshotId },
+      run: { setupRunId, state: "CONFIRMED" },
+      replayed: false,
       stage2HandoffEligible: false,
-      mockStep2DemoEligible: true,
-      mockStep2Bundle: { founderProfileSnapshotId: snapshotId },
     });
+    expect(Object.keys(published).sort()).toEqual(
+      ["profile", "replayed", "run", "stage2HandoffEligible"].sort(),
+    );
     expect(
       payloadOf(
         await client.callTool({
@@ -503,6 +514,26 @@ describe("BizForge MCP HTTP server", () => {
         }),
       ),
     ).toMatchObject({ profile: { snapshotId } });
+
+    const researchBundle = buildSyntheticResearchBundle(
+      ConfirmedFounderProfileSnapshotSchema.parse(profile),
+      [EvidenceItemSchema.parse(evidence)],
+    );
+    const savedBundle = await client.callTool({
+      name: "bizforge_save_research_bundle",
+      arguments: {
+        bundle: researchBundle,
+        isSynthetic: true,
+        acceptMockStorage: true,
+      },
+    });
+    expect(savedBundle.isError, JSON.stringify(savedBundle.content)).not.toBe(true);
+    expect(payloadOf(savedBundle)).toMatchObject({
+      bundle: {
+        bundleId: researchBundle.bundleId,
+        founderProfile: { snapshotId },
+      },
+    });
 
     const latest = payloadOf(
       await client.callTool({
@@ -581,7 +612,6 @@ describe("BizForge MCP HTTP server", () => {
       charts: [
         {
           eligible: true,
-          demoEligible: true,
           absoluteChange: 15,
           percentageChange: 62.5,
           sampleSize: 39,
@@ -1109,7 +1139,7 @@ describe("BizForge MCP HTTP server", () => {
     restartedStore.close();
   });
 
-  it("defaults to local SQLite and uses memory only with an explicit mock mode", async () => {
+  it("always configures local SQLite even when a legacy mock mode is present", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bizforge-store-config-"));
     cleanup.push(() => rm(directory, { recursive: true, force: true }));
 
@@ -1125,21 +1155,20 @@ describe("BizForge MCP HTTP server", () => {
     });
     if (persistentStore instanceof SqliteBizForgeDataStore) persistentStore.close();
 
-    const mockStore = createConfiguredBizForgeDataStore({
+    const legacyModeStore = createConfiguredBizForgeDataStore({
       cwd: directory,
-      environment: { BIZFORGE_STORAGE_MODE: "mock" },
+      environment: {
+        BIZFORGE_STORAGE_MODE: "mock",
+        BIZFORGE_DB_PATH: "legacy-mode.sqlite",
+      },
     });
-    expect(mockStore.getDataStatus()).toMatchObject({
-      dataMode: "mock",
-      storageBackend: "memory",
-      ephemeral: true,
+    expect(legacyModeStore).toBeInstanceOf(SqliteBizForgeDataStore);
+    expect(legacyModeStore.getDataStatus()).toMatchObject({
+      dataMode: "persistent",
+      storageBackend: "sqlite",
+      ephemeral: false,
     });
-    expect(() =>
-      createConfiguredBizForgeDataStore({
-        cwd: directory,
-        environment: { BIZFORGE_STORAGE_MODE: "unknown" },
-      }),
-    ).toThrow(/must be either/);
+    if (legacyModeStore instanceof SqliteBizForgeDataStore) legacyModeStore.close();
     expect(() =>
       createConfiguredBizForgeDataStore({
         cwd: directory,
