@@ -7,6 +7,22 @@ resulting business hypotheses against a founder's capabilities and constraints.
 This repository is a hackathon project built on
 [TrueForge](https://github.com/truefoundry/trueforge), Bright Data, and OpenAI.
 
+## Agent and scraping flow
+
+BizForge uses a TrueForge agent to choose the research, Bright Data to scrape agreed public
+sources, and ordinary TypeScript to check the results before the agent proposes an opportunity.
+The Bright Data ingestion adapter is the next implementation slice.
+
+![BizForge turns web data into business opportunities](docs/images/agent-scraping/01-overview.png)
+
+![The agent chooses what to look for](docs/images/agent-scraping/02-agent-search-plan.png)
+
+![Bright Data scrapes the market](docs/images/agent-scraping/03-bright-data-scraping.png)
+
+![Code turns scraped pages into useful facts](docs/images/agent-scraping/04-source-backed-facts.png)
+
+![The agent connects the dots](docs/images/agent-scraping/05-business-opportunity.png)
+
 ## Workflow
 
 BizForge is designed as three stages:
