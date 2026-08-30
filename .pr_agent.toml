@@ -1,0 +1,15 @@
+[github_app]
+pr_commands = [
+  "/agentic_describe",
+  "/agentic_review"
+]
+
+[review_agent]
+comments_location_policy = "both"
+inline_comments_severity_threshold = 2
+issues_user_guidelines = """
+Focus on correctness at provider and persistence boundaries: legal state transitions,
+idempotency, retry safety, evidence provenance, schema drift, prompt-injection isolation,
+personal-data minimization, and credential-safe logging. Require regression tests for
+accepted findings and flag claims that can be emitted without resolvable evidence.
+"""
