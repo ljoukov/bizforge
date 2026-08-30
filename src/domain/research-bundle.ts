@@ -128,6 +128,7 @@ export const ResearchBundleSchema = z
     const evidenceById = new Map(
       bundle.evidence.map((evidence) => [evidence.evidenceId, evidence]),
     );
+    const allClaims = claimSetsInBundle(bundle).flatMap(flattenClaimSet);
     // Each artifact schema requires every nested claim citation to be present
     // in its aggregate evidenceIds, so these checks cover direct and nested
     // evidence without relying on the weaker bundle.generatedAt boundary.
@@ -154,6 +155,14 @@ export const ResearchBundleSchema = z
           postdatedMessage: `opportunity evidence ${evidenceId} was retrieved after the dossier was generated`,
         })),
       ),
+      ...allClaims.flatMap((claim) =>
+        claim.evidenceIds.map((evidenceId, evidenceIndex) => ({
+          id: evidenceId,
+          path: ["claims", claim.claimId, "evidenceIds", evidenceIndex],
+          consumedAt: claim.createdAt,
+          postdatedMessage: `claim evidence ${evidenceId} was retrieved after claim ${claim.claimId} was created`,
+        })),
+      ),
     ];
     for (const issue of findPostdatedEvidence(evidenceById, timedEvidenceReferences)) {
       context.addIssue({
@@ -163,7 +172,6 @@ export const ResearchBundleSchema = z
       });
     }
 
-    const allClaims = claimSetsInBundle(bundle).flatMap(flattenClaimSet);
     const claimIds = allClaims.map(({ claimId }) => claimId);
     if (!hasUniqueValues(claimIds)) {
       context.addIssue({

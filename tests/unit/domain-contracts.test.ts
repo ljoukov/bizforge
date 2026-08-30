@@ -653,6 +653,47 @@ describe("research bundle integrity", () => {
     }
   });
 
+  it.each([
+    {
+      claimId: "claim-signal-observed",
+      makePostdatedClaim: (bundle: ReturnType<typeof makeBundle>) => {
+        first(first(bundle.marketSignals).claims.observed).createdAt = "2026-08-29T11:00:00Z";
+      },
+    },
+    {
+      claimId: "claim-offering-inferred",
+      makePostdatedClaim: (bundle: ReturnType<typeof makeBundle>) => {
+        first(first(bundle.opportunities).offering.claims.inferred).createdAt =
+          "2026-08-29T11:00:00Z";
+      },
+    },
+    {
+      claimId: "claim-profile-observed",
+      makePostdatedClaim: (bundle: ReturnType<typeof makeBundle>) => {
+        const observed = bundle.founderProfile.claims.observed as Array<
+          ReturnType<typeof observedClaim>
+        >;
+        observed.push(observedClaim("claim-profile-observed"));
+        first(observed).createdAt = "2026-08-29T11:00:00Z";
+      },
+    },
+  ])("rejects evidence retrieved after $claimId was created", ({ claimId, makePostdatedClaim }) => {
+    const bundle = makeBundle();
+    first(bundle.evidence).provenance.retrievedAt = "2026-08-29T11:30:00Z";
+    makePostdatedClaim(bundle);
+
+    const result = ResearchBundleSchema.safeParse(bundle);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({
+          path: ["claims", claimId, "evidenceIds", 0],
+          message: `claim evidence evidence-1 was retrieved after claim ${claimId} was created`,
+        }),
+      );
+    }
+  });
+
   it("requires opportunity inputs to predate dossier generation", () => {
     const lateSignal = makeBundle();
     first(lateSignal.marketSignals).calculatedAt = "2026-08-29T13:00:00Z";
