@@ -2,10 +2,10 @@
 name: bizforge-founder-minimum-interview
 description: Runs the minimum necessary BizForge founder interview, asking only for missing business constraints and preferences and recording answers as provenance-backed self-report. Use after public evidence is collected or skipped, when required FounderProfileSnapshot fields remain unknown, uncertain, or contradictory.
 license: MIT
-compatibility: Requires TrueForge with a sandbox enabled, an interactive chat or Generative UI channel, and durable typed BizForge setup-run and user-input evidence APIs. Without durable persistence, the interview may produce an explicitly non-confirmable session draft only.
+compatibility: Requires TrueForge with a sandbox enabled, an interactive chat or Generative UI channel, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # BizForge minimum founder interview
@@ -31,28 +31,40 @@ If consent is revoked or deletion is requested, stop the interview and hand off 
 
 ## Required runtime capabilities
 
-Use the durable BizForge evidence API to persist each retained answer as a canonical
-`user_input` evidence item. The host or persistence boundary must inject authoritative
-TrueForge session, turn, and input IDs. Never invent those identifiers, and never use a sandbox
-file path as a durable artifact reference.
+Call `bizforge_get_data_status` before asking for or retaining founder input. If `isMock` or
+`ephemeral` is true, keep real founder answers `session_only`: do not call
+`bizforge_put_evidence`, do not claim persistence, and do not make the draft confirmable. Only
+explicitly synthetic demo answers may exercise mock writes after the user accepts the
+mock/ephemeral limitation. Label them `mock=true` and show the exact returned `source`:
+`mcp_write` for a synthetic demo write and `mock_seed` only for a seeded fixture. For that
+accepted synthetic demo only, pass `isSynthetic: true` and `acceptMockStorage: true` on the
+applicable mock writes.
 
-Use the typed setup-run API to load the current founder evidence/interview state and atomically
-persist each `FounderInterviewPatch` with `setupRunId`, expected version, and an idempotency key.
-That API's schema is authoritative for handoff-envelope field types, required/optional rules,
-and enums. Do not bypass its validation, blindly retry an ambiguous transition, or reconstruct
-missing persisted state from conversation memory.
+Use `bizforge_put_evidence` to record each retained answer as a canonical `user_input` evidence
+item and `bizforge_get_evidence` to verify that its returned ID resolves. Describe that record as
+durable only when `bizforge_get_data_status` says it is durable. The host or persistence boundary
+must inject authoritative TrueForge session, turn, and input IDs. Never invent those identifiers,
+and never use a sandbox file path as a durable artifact reference.
 
-Before durably persisting any answer—even on the interview-only branch—explain and record
-separate consent scopes for `retain_minimized_founder_self_report`,
+Use `bizforge_get_founder_setup_run` to load current evidence/interview state and
+`bizforge_transition_founder_setup_run` to atomically persist each `FounderInterviewPatch` with
+`setupRunId`, expected version, and an idempotency key. The patch is conceptual and transition
+`stateData` is currently untyped; apply this skill's output and acceptance checks before calling
+the tool and do not claim that the MCP validated the patch shape. Never blindly retry an
+ambiguous transition or reconstruct missing persisted state from conversation memory.
+
+Before durably persisting any answer—even on the interview-only branch—explain and use
+`bizforge_record_consent` to record separate consent scopes for
+`retain_minimized_founder_self_report`,
 `retain_minimized_founder_snapshot`, optional `retain_founder_version_history`, and optional
 `use_confirmed_founder_snapshot_for_research`. The last scope controls Stage 2 use and is not a
 condition for completing a private Step 1 draft. If self-report retention is declined, keep the
 conversation `session_only`, do not call the evidence persistence API, and do not confirm a
 snapshot.
 
-If durable persistence is unavailable, the founder may continue conversationally, but label the
-result `session_only` and `readyForDraft: false`. Do not claim that it can be confirmed or used
-by Stage 2.
+If durable persistence is unavailable or `bizforge_get_data_status` reports mock/ephemeral mode,
+the founder may continue conversationally, but label the result `session_only` and
+`readyForDraft: false`. Do not claim that it can be confirmed or used by Stage 2.
 
 ## Build a gap map first
 
@@ -131,8 +143,9 @@ The canonical business-appetite constraints are:
 
 ## Record self-report as evidence
 
-For each answer or correction, send the normalized answer and its field key to the durable
-evidence tool. It must return a complete canonical `user_input` evidence item, including title,
+For each answer or correction, send the normalized answer and its field key to
+`bizforge_put_evidence`. It must return a complete canonical `user_input` evidence item,
+including title,
 summary, source record ID, SHA-256 digest, durable artifact reference, locator, and extraction
 provenance. The host or tool injects runtime session/turn/input IDs. Represent the corresponding
 claim as an observed statement such as “The founder states …”.
@@ -172,15 +185,18 @@ FounderInterviewPatch
   observedClaimIds[]
   contradictions[]
   unresolvedFields[]
-  persistenceStatus         persisted | session_only | failed
+  persistenceStatus         durable | mock_ephemeral | session_only | failed
   readyForDraft
 ```
 
-The persisted evidence and claim tool schemas are authoritative. Never inline an approximate
-evidence record when persistence failed.
+The `bizforge_put_evidence` schema is authoritative for evidence, while the interview patch in
+transition `stateData` is not server-validated. Never inline an approximate evidence record when
+persistence failed.
 
-The setup-run API must validate this envelope before a compare-and-set transition to
-`DRAFT_REVIEW`. A rendered chat summary is not a persisted handoff.
+Apply every output and acceptance check in this skill, then call
+`bizforge_transition_founder_setup_run` for the compare-and-set transition to `DRAFT_REVIEW`.
+The successful transition records the untyped patch in the active backend but does not prove its
+shape is valid or make mock storage durable. A rendered chat summary is not an MCP handoff.
 
 Do not emit a schema-valid placeholder merely to make `readyForDraft` true.
 

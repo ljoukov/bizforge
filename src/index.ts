@@ -4,4 +4,5 @@ export * from "./application/score-opportunity.js";
 export * from "./application/validate-research-bundle.js";
 export * from "./config/environment.js";
 export * from "./domain/index.js";
+export * from "./mcp/index.js";
 export * from "./ports/index.js";

@@ -1,4 +1,28 @@
-# Stage 2 architecture
+# BizForge architecture
+
+## Shared stage boundary
+
+All three stages exchange canonical artifacts through one application-owned MCP server. Chat
+text and temporary Daytona files are never handoff records.
+
+```text
+Stage 1 setup agent
+  -> confirmed FounderProfileSnapshot + evidence
+  -> BizForgeDataStore
+       -> Stage 2 reads the exact snapshot and writes a validated ResearchBundle
+       -> Stage 3 reads the exact bundle version through read-only MCP projections
+```
+
+`BizForgeDataStore` separates persistence from protocol and domain validation. The first adapter
+is an in-memory, synthetic demo store. Publishing an explicitly synthetic founder snapshot in
+that mode deterministically produces a mock ResearchBundle tied to the same snapshot, exercising
+the real contracts while Stage 2 collection is not yet connected. The production follow-up will
+replace that adapter with SQLite; mock/persisted data mode remains separate from memory/SQLite
+storage backend so a fixture can never be mistaken for evidence.
+
+The MCP endpoint uses Streamable HTTP on loopback with Host/Origin validation. Step 1 receives
+the setup, consent, evidence, confirmation and deletion tools; Step 2 receives the bundle write
+boundary; Step 3 receives explicit read-only tools only.
 
 ## Goal
 
@@ -37,6 +61,10 @@ Deterministic claim validation -> versioned ResearchBundle
 - Delegate bounded qualitative research to specialist subagents.
 - Map value chains and propose scarcity-removal hypotheses.
 - Seek counter-evidence and synthesize opportunity dossiers.
+- Render Stage 3 evidence and comparisons with Generative UI only after loading the current
+  OpenUI instructions.
+- Use the Daytona-backed sandbox only for deterministic grouping, arithmetic, sensitivity checks
+  and chart-data shaping; sandbox calculations never become evidence.
 
 ### Deterministic TypeScript
 
@@ -60,6 +88,9 @@ configuration and must not enter prompts, artifacts, logs or sandbox files.
 
 Personal profile ingestion requires consent. Persist the confirmed, minimized founder snapshot;
 do not retain fields that the research workflow does not need.
+
+The in-memory demo is not durable. Real founder profile collection stays disabled/session-only in
+mock mode; only explicitly synthetic demo snapshots may exercise the downstream handoff.
 
 ## Scarcity workflow
 

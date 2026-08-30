@@ -23,13 +23,17 @@ validation.
 
 ## Current scope
 
-The first implementation slice establishes the contracts and safety rails for Stage 2:
+The current implementation establishes the contracts and safety rails for all three stages:
 
+- four consent-first Founder Setup skills for Stage 1;
 - strict runtime-validated domain schemas;
 - an explicit research-run state machine;
 - evidence-linked claims and opportunity dossiers;
 - deterministic opportunity scoring;
 - research-bundle validation;
+- a loopback Streamable HTTP MCP server shared by all three stages;
+- a replaceable in-memory data-store adapter with a validated synthetic research fixture;
+- three read-only exploration skills for evidence, Generative UI charts and skeptical review;
 - provider ports, plus a headless TrueForge session/turn adapter; the Bright Data adapter follows
   in the ingestion PR;
 - fail-closed handling for indeterminate, non-idempotent TrueForge session creation;
@@ -52,6 +56,21 @@ npm run check
 
 `npm run check` runs formatting verification, linting, TypeScript checks, unit tests and the
 production build. Unit tests use synthetic records and do not require API keys.
+
+### Local MCP demo
+
+The MCP endpoint is intentionally local and unauthenticated. It binds to `127.0.0.1:8791`,
+applies localhost Host/Origin validation, and exposes `/mcp` plus `/healthz`:
+
+```bash
+npm run build
+npm run mcp:start
+```
+
+The current adapter is `memory` and all seeded records have `dataMode: mock`. It exists to prove
+the Step 1 -> mocked Step 2 -> Step 3 handoff; it is ephemeral and must not be represented as
+durable storage or real market research. A later SQLite adapter will implement the same
+`BizForgeDataStore` boundary without changing the MCP contract.
 
 ## Credentials
 

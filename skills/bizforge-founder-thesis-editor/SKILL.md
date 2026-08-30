@@ -2,10 +2,10 @@
 name: bizforge-founder-thesis-editor
 description: Synthesizes, edits, validates, confirms, versions, or deletes a BizForge FounderThesis while preserving evidence and epistemic labels. Use when founder evidence and interview answers are ready for review, or when an existing founder thesis must be corrected, reconfirmed, revoked, or removed.
 license: MIT
-compatibility: Requires TrueForge with a sandbox enabled plus durable typed BizForge setup-run, evidence-resolution, snapshot-persistence, canonical-validation, consent, and deletion APIs. Without them, drafts cannot be confirmed.
+compatibility: Requires TrueForge with a sandbox enabled and the BizForge MCP Step 1 tools listed below. Without them, drafts cannot be confirmed.
 metadata:
   author: bizforge
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # BizForge founder thesis editor
@@ -37,22 +37,39 @@ fabricate a value to satisfy the schema.
 
 ## Required runtime capabilities
 
-Before confirmation, verify that attached BizForge application tools can:
+Before confirmation, verify these attached BizForge MCP tools:
 
-- get and atomically transition the versioned founder setup run;
-- resolve every referenced evidence item;
-- validate against the pinned canonical `FounderProfileSnapshotSchema` version;
-- apply the additional confirmed-snapshot gate and persist an immutable version;
-- resolve consent scopes for evidence retention, version history, and Stage 2 use;
-- request deletion and inspect deletion status.
+- `bizforge_get_data_status` for the authoritative data and storage mode;
+- `bizforge_get_founder_setup_run` and `bizforge_transition_founder_setup_run` for versioned
+  setup state;
+- `bizforge_get_evidence` for every referenced evidence item;
+- `bizforge_validate_founder_profile_snapshot` for the pinned canonical schema and confirmed
+  snapshot gate;
+- `bizforge_save_confirmed_founder_profile` and `bizforge_get_confirmed_founder_profile` for
+  immutable canonical Step 1 output;
+- `bizforge_get_consent` for evidence retention, version history, and Stage 2 use;
+- `bizforge_request_founder_data_deletion` and `bizforge_get_deletion_status` for deletion.
+
+Call `bizforge_get_data_status` first. If `isMock` or `ephemeral` is true, a real founder thesis
+must remain `session_only`: do not call `bizforge_save_confirmed_founder_profile`, set
+`confirmedAt`, or claim durable retention/deletion. Only an explicitly synthetic demo snapshot
+may exercise the mock validation/save path, and only after the user accepts that it is mock and
+ephemeral. Label it `mock=true`, show the exact returned `source` (`mcp_write` for a synthetic
+demo write and `mock_seed` only for a seeded fixture), and use `demoComplete` rather than real
+Step 1 completion. Call the save with `isSynthetic: true` and `acceptMockStorage: true` only
+after that acknowledgement. Its deterministic mock `ResearchBundle` is a demo handoff to Step
+3, never real Step 2 research. Keep `stage2HandoffEligible: false`; report any
+`mockStep2DemoEligible` value separately.
 
 The TrueForge sandbox is temporary working space. It is never the durable snapshot, evidence,
-or consent store. If any required capability is absent, keep the output as a clearly marked
-session draft and do not set `confirmedAt`.
+or consent store. If any required capability is absent or the data status is mock/ephemeral,
+keep real input as a clearly marked session draft and do not set `confirmedAt`.
 
-Load evidence and interview envelopes only from the typed setup-run API. Persist draft edits and
-the final `CONFIRMED` transition with the current expected version and an idempotency key. Do not
-rebuild missing state from chat history, bypass envelope validation, or blindly retry an
+Load evidence and interview envelopes only with `bizforge_get_founder_setup_run`. Record draft
+edits with `bizforge_transition_founder_setup_run`, the current expected version, and an
+idempotency key. The transition's `stateData` is untyped, so apply the focused skills' acceptance
+checks yourself. `bizforge_save_confirmed_founder_profile` performs the atomic final
+`CONFIRMED` transition. Do not rebuild missing state from chat history or blindly retry an
 ambiguous write.
 
 ## Compose the editable thesis
@@ -84,10 +101,13 @@ assumption. Never collapse those categories into a single authoritative narrativ
 5. Base-validate that rendered draft with `confirmedAt` absent, then ask for explicit
    confirmation of the exact version.
 6. Only after the founder confirms it, have the host stamp `confirmedAt`, atomically recheck
-   active retention consent, and run the confirmed-snapshot validator against the exact final
-   artifact. Silence, continued conversation, or approval of an earlier version is not
-   confirmation.
-7. Persist and transition to `CONFIRMED` only when that post-approval validation succeeds.
+   active retention consent with `bizforge_get_consent`, and call
+   `bizforge_validate_founder_profile_snapshot` against the exact final artifact. Silence,
+   continued conversation, or approval of an earlier version is not confirmation.
+7. Only when that post-approval validation succeeds, call
+   `bizforge_save_confirmed_founder_profile`, verify its immutable output with
+   `bizforge_get_confirmed_founder_profile`, and use the updated `CONFIRMED` run returned by the
+   atomic save. Do not call `bizforge_transition_founder_setup_run` again.
 
 ## Canonical machine snapshot
 
@@ -133,10 +153,10 @@ Observed and inferred claims require one or more evidence IDs. Inferred claims a
 require a rationale. Assumptions must have no evidence IDs and require both a rationale and a
 validation plan. Every claim has a unique ID, statement, creation time, and bounded confidence.
 
-Validate the draft through the pinned BizForge base validator before asking for confirmation,
-then validate the host-stamped exact artifact through `ConfirmedFounderProfileSnapshotSchema`
-after approval. Manual inspection or an “equivalent” model-generated validator is not
-sufficient. Check that:
+Validate the draft through `bizforge_validate_founder_profile_snapshot` before asking for
+confirmation, then validate the host-stamped exact artifact through the same tool's confirmed
+mode after approval. The tool applies `ConfirmedFounderProfileSnapshotSchema`; manual inspection
+or an “equivalent” model-generated validator is not sufficient. Check that:
 
 - all identifiers are non-empty opaque URL-safe strings;
 - all evidence IDs resolve in the evidence store;
@@ -151,10 +171,12 @@ sufficient. Check that:
 
 Base-schema success is necessary but not sufficient because drafts intentionally allow
 `confirmedAt` to be absent. The confirmed-snapshot gate must additionally require `confirmedAt`.
-Active `use_confirmed_founder_snapshot_for_research` consent is a separate handoff gate: a
-founder may confirm and retain a private snapshot without authorizing Stage 2. If either
-validator is unavailable, the thesis may remain editable, but it must not be marked confirmed
-or passed to Stage 2.
+`bizforge_save_confirmed_founder_profile` creates the canonical immutable Step 1 output shared
+with Step 2 and Step 3 through MCP. Active
+`use_confirmed_founder_snapshot_for_research` consent is a separate
+`stage2HandoffEligible` gate: a founder may confirm and retain a private snapshot without
+authorizing Stage 2. If validation or save is unavailable, the thesis may remain editable, but
+it must not be marked confirmed or passed to Stage 2.
 
 ## Versioning and status
 
@@ -186,7 +208,8 @@ Reserve the full-system inventory for an explicit full-deletion request. It cove
 receipt, snapshots and version history, evidence artifacts, claims, research bundles,
 founder-fit derivatives, indexes/caches, TrueForge session transcripts, provider-side retained
 data, and backup-expiry obligations. Send the applicable scoped or full inventory to the
-deletion coordinator and inspect per-system status. Report deletion as complete only after all
+`bizforge_request_founder_data_deletion` and inspect per-system status with
+`bizforge_get_deletion_status`. Report deletion as complete only after all
 controllable copies are confirmed removed and any provider/backup expiry obligation is
 explicitly resolved.
 

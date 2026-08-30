@@ -2,10 +2,10 @@
 name: bizforge-founder-public-evidence
 description: Collects consented public professional evidence for a BizForge founder profile and produces a minimized, provenance-linked evidence draft without psychological inference. Use when founder setup starts from a LinkedIn or other public professional profile, or when that evidence must be refreshed.
 license: MIT
-compatibility: Requires TrueForge with a sandbox enabled, an approved public-data connector, and durable typed BizForge setup-run, consent, evidence, and deletion APIs. Without those APIs, use the interview-only fallback and do not call an external profile source.
+compatibility: Requires TrueForge with a sandbox enabled, an approved public-data connector, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # BizForge founder public evidence
@@ -33,22 +33,37 @@ Do not treat a pasted URL, prior conversation, or continued use of the app as co
 
 ## Required runtime capabilities
 
-Before external collection, verify that the attached BizForge application tools can:
+Before external collection, verify these attached BizForge MCP tools:
 
-- create/get a founder setup run and atomically transition its versioned state;
-- record and resolve consent;
-- persist and resolve canonical evidence items and minimized artifacts;
-- request deletion and inspect deletion status.
+- `bizforge_get_data_status` for the authoritative data and storage mode;
+- `bizforge_create_founder_setup_run`, `bizforge_get_founder_setup_run`, and
+  `bizforge_transition_founder_setup_run` for versioned setup state;
+- `bizforge_record_consent` and `bizforge_get_consent` for separately revocable consent;
+- `bizforge_put_evidence` and `bizforge_get_evidence` for canonical evidence;
+- `bizforge_request_founder_data_deletion` and `bizforge_get_deletion_status` for deletion.
 
-An approved public-profile connector must also be attached. The TrueForge sandbox is temporary
-working space, not the durable evidence store; never use a sandbox path as a durable
+Call `bizforge_get_data_status` first. If `isMock` or `ephemeral` is true, do not call any
+external profile connector with a real person's URL or data and do not persist real founder
+data. Offer the interview-only `session_only` path. Only explicitly synthetic demo data may use
+mock writes after the user accepts the mock/ephemeral limitation. Visibly label it `mock=true`
+and show the exact returned `source`: `mcp_write` for a synthetic demo write and `mock_seed` only
+for a seeded fixture. For the accepted synthetic demo only, pass `isSynthetic: true` where the
+tool accepts it and `acceptMockStorage: true` on mock writes. This never authorizes collection of
+a real profile.
+
+In durable non-mock mode, an approved public-profile connector must also be attached. The
+TrueForge sandbox is temporary working space, not the durable evidence store; never use a
+sandbox path as a durable
 `rawArtifactRef`. If any required durable capability is unavailable, do not call the external
 source. Explain the limitation and continue with interview-only setup.
 
-The typed setup-run API owns the canonical `ConsentReceipt` and `FounderEvidenceDraft`
-contracts. Persist these envelopes through an atomic transition with `setupRunId`, expected
-version, and an idempotency key. Do not hand off a prose-only object, bypass tool validation,
-blindly retry an ambiguous write, or advance state when persistence fails.
+The BizForge MCP tool schemas are authoritative. Record each singular `ConsentRecord` through
+`bizforge_record_consent`, canonical evidence through `bizforge_put_evidence`, and the conceptual
+`FounderEvidenceDraft` through `bizforge_transition_founder_setup_run` with `setupRunId`, expected
+version, and an idempotency key. Transition `stateData` is currently untyped, so apply every
+acceptance check in this skill before advancing and never claim that the MCP validated the draft
+shape. Do not hand off a prose-only object, blindly retry an ambiguous write, or advance state
+when persistence fails. Reconcile ambiguous writes with the matching read tool.
 
 ## Workflow
 
@@ -57,13 +72,14 @@ blindly retry an ambiguous write, or advance state when persistence fails.
    - that only business-relevant professional facts will be extracted;
    - that BizForge will retain a minimized evidence extract and confirmed founder snapshot;
    - that the founder may skip, correct, revoke consent, or request deletion.
-2. **Require an explicit affirmative response.** Record a `ConsentReceipt` with:
-   - `consentId`, `founderId`, `grantedAt`, and `status`;
-   - separately revocable scopes, requested only when needed:
+2. **Require an explicit affirmative response.** Call `bizforge_record_consent` once for each
+   requested scope. Each immutable `ConsentRecord` has its own `consentId`, `setupRunId`,
+   `founderId`, singular `scope`, `status`, source URLs, record time, and applicable grant or
+   revocation time. Request only the needed, separately revocable scopes:
      `read_public_professional_profile`, `retain_minimized_profile_evidence`,
      `retain_minimized_founder_self_report`, `retain_minimized_founder_snapshot`,
      `retain_founder_version_history`, and `use_confirmed_founder_snapshot_for_research`;
-   - the approved source URLs.
+   Preserve every returned consent ID and status.
    Reading, retaining evidence, retaining history, and using a confirmed snapshot in Stage 2
    are different permissions. Never bundle them into one all-or-nothing consent choice.
 3. **Verify identity before attaching evidence.** If the source may identify more than one
@@ -78,8 +94,8 @@ blindly retry an ambiguous write, or advance state when persistence fails.
    roles, projects, industries, products, and explicitly described skills. Do not collect
    contacts, connections, private posts, email addresses, phone numbers, or unrelated personal
    details.
-7. **Preserve provenance for every retained item.** Persist a complete canonical evidence item
-   with:
+7. **Preserve provenance for every retained item.** Call `bizforge_put_evidence` for each
+   complete canonical evidence item with:
    - a stable `evidenceId`, `title`, and minimized `summary`;
    - `evidenceType: other` for a public person/professional profile until the canonical enum
      gains a dedicated person-profile value;
@@ -105,9 +121,10 @@ blindly retry an ambiguous write, or advance state when persistence fails.
 
 Return two separate records:
 
-### `ConsentReceipt`
+### `ConsentRecord[]`
 
-- `consentId`, `founderId`, exact scopes, source URLs, grant time, and per-scope status.
+- One immutable record per scope, each with `consentId`, `setupRunId`, `founderId`, singular
+  `scope`, source URLs, record time, and status.
 - Revocation times and the processing/retention action each revoked scope requires.
 - A note that profile collection was skipped when the founder declined.
 
@@ -120,14 +137,18 @@ Return two separate records:
 - Identity ambiguities, contradictions, and missing interview fields.
 - Collection timestamp and `draft` status.
 
-The durable evidence tool's input schema is authoritative for each evidence item. If it rejects
-an item, quarantine the draft and do not hand it to the next skill as persisted evidence.
+The `bizforge_put_evidence` input schema is authoritative for each evidence item. Resolve the
+returned ID with `bizforge_get_evidence`; if either call rejects or cannot resolve an item,
+quarantine the draft and do not hand it to the next skill as persisted evidence.
 
 Never set `confirmedAt` and never label this output a confirmed `FounderProfileSnapshot`.
 
-Persist both records inside the versioned setup run. The setup-run tool's schema determines
-required/optional fields, types, enums, and forward-compatible version metadata. A successful
-compare-and-set transition to `INTERVIEW` is the handoff; chat output alone is not.
+Persist the consent records through their dedicated tool and store the conceptual evidence draft
+inside the versioned setup run. The transition tool validates its own CAS fields, not the draft's
+untyped `stateData`; enforce this skill's output and acceptance checks before calling it. A
+successful compare-and-set transition to `INTERVIEW` is the MCP-recorded handoff in the reported
+storage mode; it does not imply durability when that mode is mock/ephemeral. Chat output alone is
+not a handoff.
 
 ## Prohibited inferences
 
@@ -155,13 +176,15 @@ Handle revocation by scope:
   research derivatives, indexes/caches, TrueForge session transcripts, provider-side retained
   data, and backup-expiry obligations.
 
-Submit the inventory to the deletion coordinator and report per-system status. Do not claim
-deletion is complete while any system is pending, outside BizForge control, or waiting for
+Submit the inventory with `bizforge_request_founder_data_deletion` and report per-system status
+from `bizforge_get_deletion_status`. Do not claim deletion is complete while any system is
+pending, outside BizForge control, or waiting for
 documented backup/provider expiry.
 
 ## Acceptance checks
 
-Before handoff, verify all of the following:
+Before handoff, verify all of the following, plus a durable non-mock status from
+`bizforge_get_data_status` for any real founder:
 
 - No source call occurred before an explicit, recorded consent grant.
 - Identity is founder-confirmed or evidence remains explicitly unattached.
