@@ -41,7 +41,7 @@ validation.
 
 The current implementation establishes the contracts and safety rails for all three stages:
 
-- four consent-first Founder Setup skills for Stage 1;
+- four founder-controlled Founder Setup skills for Stage 1;
 - strict runtime-validated domain schemas;
 - an explicit research-run state machine;
 - evidence-linked claims and opportunity dossiers;

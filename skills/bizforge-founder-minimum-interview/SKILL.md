@@ -5,15 +5,15 @@ license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, an interactive chat or Generative UI channel, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # BizForge minimum founder interview
 
 > Founder setup produces an editable, evidence-backed planning thesis—not a psychological
-> profile. Use only public professional evidence collected with explicit consent and direct
-> founder self-report. Keep observation, self-report, inference, and assumption distinct;
-> collect and retain only what Stage 2 needs.
+> profile. Use only public professional evidence the founder supplied or asked BizForge to read,
+> plus direct founder self-report. Keep observation, self-report, inference, and assumption
+> distinct; collect and retain only what Stage 2 needs.
 
 ## Purpose
 
@@ -25,10 +25,12 @@ questions, or turning the interview into a personality assessment.
 
 - A `FounderEvidenceDraft`; it may be empty because profile collection was skipped.
 - Existing founder-confirmed answers and prior interview patches.
-- The active consent status and any correction, revocation, or deletion request.
+- Internal authorization status and any restriction, revocation, or deletion request the founder
+  explicitly raised.
 - An optional one-line competency or business-interest seed from the opening message.
 
-If consent is revoked or deletion is requested, stop the interview and hand off that request.
+If the founder explicitly revokes authorization or requests deletion, stop the interview and
+hand off that request. Do not introduce these controls during ordinary onboarding.
 
 ## Required runtime capabilities
 
@@ -39,33 +41,36 @@ persistent storage that accepts founder records, and do not narrate backend, sto
 MCP source fields in ordinary interview replies. If durable persistence is unavailable, fail
 closed before collecting or retaining answers.
 
-Use `bizforge_put_evidence` to record each retained answer as a canonical `user_input` evidence
-item and `bizforge_get_evidence` to verify that its returned ID resolves. Describe that record as
-durable only when `bizforge_get_data_status` says it is durable. The host or persistence boundary
-may expose authoritative TrueForge session and turn IDs. Use those values only when available;
-never ask the founder for them and never fabricate host metadata. If they are unavailable, use a
+Before final confirmation, use each volunteered answer only in the active editable working draft;
+do not call `bizforge_put_evidence` or claim that the answer has been durably retained. After the
+founder explicitly confirms the exact profile for saving and opportunity research, use
+`bizforge_put_evidence` to record each confirmed answer as a canonical `user_input` evidence item
+and `bizforge_get_evidence` to verify that its returned ID resolves. Describe that record as durable
+only when `bizforge_get_data_status` says it is durable. The host or persistence boundary may
+expose authoritative TrueForge session and turn IDs. Use those values only when available; never
+ask the founder for them and never fabricate host metadata. If they are unavailable, use a
 schema-valid non-agent extraction method for the directly normalized self-report or do not retain
 the answer. Never use a sandbox file path as a durable artifact reference.
 
-Use `bizforge_get_founder_setup_run` to load current evidence/interview state and
-retain the returned internal IDs without asking the founder for them. After each answered group,
-merge the new normalized values and evidence IDs into the complete previously persisted patch,
-then use `bizforge_transition_founder_setup_run` for an `INTERVIEW -> INTERVIEW` checkpoint with
-the current version and a sandbox-generated opaque idempotency key. A transition replaces
-`stateData`; sending only the latest answer would erase prior interview state. When
-`readyForDraft` is true, send the complete merged patch in the single `INTERVIEW -> DRAFT_REVIEW`
-transition. The patch is conceptual and transition `stateData` is currently untyped; apply this
-skill's output and acceptance checks before calling the tool and do not claim that the MCP
-validated the patch shape. Never blindly retry an ambiguous transition or reconstruct missing
-persisted state from conversation memory.
+Use `bizforge_get_founder_setup_run` to load current workflow state and retain the returned internal
+IDs without asking the founder for them. Keep unconfirmed interview content in the active
+TrueForge working draft rather than durable MCP `stateData`. A transition may checkpoint
+non-content workflow progress, but it must not persist the founder's answers before the concise
+final confirmation handled by the thesis editor. When `readyForDraft` is true, move to
+`DRAFT_REVIEW` with the current version and a sandbox-generated opaque idempotency key, then render
+the complete working draft in the same active setup conversation. The patch is conceptual and
+transition `stateData` is currently untyped; apply this skill's output and acceptance checks before
+calling the tool and do not claim that the MCP validated the patch shape. Never blindly retry an
+ambiguous transition or reconstruct missing persisted state after the active context is lost.
 
-Before durably persisting any answer—even on the interview-only branch—explain and use
-`bizforge_record_consent` to record separate consent scopes for
-`retain_minimized_founder_self_report`,
-`retain_minimized_founder_snapshot`, optional `retain_founder_version_history`, and optional
-`use_confirmed_founder_snapshot_for_research`. The last scope controls Stage 2 use and is not a
-condition for completing a private Step 1 draft. If self-report retention is declined, do not
-retain the answer, call the evidence persistence API, or confirm a snapshot.
+Volunteering an interview answer authorizes its use in the active editable working draft, but not
+durable persistence by itself. Do not interrupt normal onboarding with a separate consent,
+privacy, storage, retention, revocation, or deletion questionnaire. The thesis editor asks one
+concise final content action: `Confirm and save this profile for opportunity research?` Only an
+affirmative response to that exact reviewed profile authorizes persistence and downstream use;
+the thesis editor then records the required MCP scopes internally before any answer is persisted.
+If the founder explicitly says not to save an answer, restricts its use, revokes authorization, or
+requests deletion, honor that request and do not persist or reuse the affected content.
 
 If durable persistence is unavailable, do not collect founder answers. Briefly ask the founder
 to retry after the service is restored; do not claim that a draft can be confirmed or used by
@@ -86,12 +91,13 @@ Never re-ask a confirmed field. Never infer appetite or tolerance values from pr
 ## Start naturally from a one-line seed
 
 If the opening message is only a phrase such as `workflow and operations automation`, record it
-as a candidate competency after the consent gate and begin the interview. Do not ask the founder
-to restate it in a schema, provide IDs, or supply the rest of the profile at once. Ask for the
-candidate competency's self-assessed level and optional years of experience, then gather the
-missing business preferences in compact conversational groups. The short seed does not imply a
-name, budget, availability, target revenue date, team size, offer model, customer segment, sales
-tolerance, risk tolerance, regulatory tolerance, exclusions, or access advantage.
+as a candidate competency in the active working draft and begin the interview. Do not ask the
+founder to restate it in a schema, provide IDs, answer a privacy question, or supply the rest of
+the profile at once. Ask for the candidate competency's self-assessed level and optional years of
+experience, then gather the missing business preferences in compact conversational groups. The
+short seed does not imply a name, budget, availability, target revenue date, team size, offer
+model, customer segment, sales tolerance, risk tolerance, regulatory tolerance, exclusions, or
+access advantage.
 
 Keep each turn easy to answer: normally ask one coherent group with no more than four related
 values, accept natural-language replies, normalize them, recompute the gap map, and move to the
@@ -124,17 +130,19 @@ snapshot.
 
 If no candidate competency exists, ask the founder to name one to three competencies relevant
 to building, operating, or selling a business, choose a self-assessed level, and optionally give
-years of experience. Persist each as `user_input` evidence. Make clear that the founder may
-correct or remove it and that the self-assessment is not externally verified.
+years of experience. Prepare each as `user_input` evidence for persistence only after the final
+profile confirmation. Make clear that the founder may correct or remove it and that the
+self-assessment is not externally verified.
 
-After the founder confirms the normalized self-assessment, attach the returned `user_input`
-evidence ID to that competency. Put attribution confidence on the observed claim: after exact
-confirmation it may use `lower = estimate = upper = 1` because it says only that the founder
-made the statement. For the competency's distinct proficiency confidence, use the conservative
-uncorroborated-self-report policy `lower = 0.25`, `estimate = 0.5`, `upper = 0.75`, with a
-rationale that the level is self-reported and not externally verified. Do not raise proficiency
-confidence merely because attribution is certain; only a pinned deterministic policy using new
-corroborating evidence may change it. Optional `yearsExperience` must be between 0 and 80.
+After the founder confirms and authorizes saving the complete exact profile, persist the
+normalized self-assessment and attach the returned `user_input` evidence ID to that competency.
+Put attribution confidence on the observed claim: after exact confirmation it may use
+`lower = estimate = upper = 1` because it says only that the founder made the statement. For the
+competency's distinct proficiency confidence, use the conservative uncorroborated-self-report
+policy `lower = 0.25`, `estimate = 0.5`, `upper = 0.75`, with a rationale that the level is
+self-reported and not externally verified. Do not raise proficiency confidence merely because
+attribution is certain; only a pinned deterministic policy using new corroborating evidence may
+change it. Optional `yearsExperience` must be between 0 and 80.
 
 Every question must offer “not sure” or “prefer not to answer.” A declined required value stays
 unresolved; it is not permission to choose a default.
@@ -163,15 +171,16 @@ The canonical business-appetite constraints are:
 
 ## Record self-report as evidence
 
-For each answer or correction, send the normalized answer and its field key to
-`bizforge_put_evidence`. It must return a complete canonical `user_input` evidence item,
-including title,
-summary, source record ID, SHA-256 digest, durable artifact reference, locator, and extraction
-provenance. The host or tool injects runtime session/turn/input IDs. Represent the corresponding
-claim as an observed statement such as “The founder states …”.
+For each answer or correction, prepare the normalized answer and its field key in the working
+draft. After the founder explicitly confirms and authorizes saving the exact profile, send those
+confirmed answers to `bizforge_put_evidence`. It must return a complete canonical `user_input`
+evidence item, including title, summary, source record ID, SHA-256 digest, durable artifact
+reference, locator, and extraction provenance. The host or tool injects runtime
+session/turn/input IDs. Represent the corresponding claim as an observed statement such as “The
+founder states …”.
 
-A founder-confirmed correction creates a new user-input evidence item and claim. Do not edit
-the public source or silently replace conflicting history.
+After final save authorization, a founder-confirmed correction creates a new user-input evidence
+item and claim. Do not edit the public source or silently replace conflicting history.
 
 When testimony conflicts with public evidence:
 
@@ -201,11 +210,11 @@ FounderInterviewPatch
   competencies[]
   constraints[]
   accessAdvantages[]
-  userInputEvidenceIds[]
-  observedClaimIds[]
+  userInputEvidenceIds[]      empty until final confirmation persists the prepared evidence
+  observedClaimIds[]          empty until final confirmation persists the prepared claims
   contradictions[]
   unresolvedFields[]
-  persistenceStatus         durable | failed
+  persistenceStatus         pending_confirmation | durable | failed
   readyForDraft
 ```
 
@@ -214,9 +223,10 @@ transition `stateData` is not server-validated. Never inline an approximate evid
 persistence failed.
 
 Apply every output and acceptance check in this skill, then call
-`bizforge_transition_founder_setup_run` for the compare-and-set transition to `DRAFT_REVIEW`.
-The successful transition records the untyped patch but does not prove its shape is valid. A
-rendered chat summary is not an MCP handoff.
+`bizforge_transition_founder_setup_run` for the compare-and-set transition to `DRAFT_REVIEW`
+without placing unconfirmed founder answers in durable `stateData`. The successful transition
+records workflow progress but does not prove the working patch shape is valid. A rendered chat
+summary is not an MCP handoff.
 
 Do not emit a schema-valid placeholder merely to make `readyForDraft` true.
 
@@ -236,7 +246,9 @@ Before handoff to `bizforge-founder-thesis-editor`, verify:
 - Every question mapped to an actually missing, candidate, or contradictory field.
 - No confirmed answer was asked twice.
 - Normalized values satisfy the canonical constraints and were echoed for correction.
-- Every retained answer has resolvable user-input evidence.
+- Before final confirmation, no answer was durably persisted; after confirmation, every retained
+  answer has resolvable user-input evidence.
 - Unknown or declined values remain explicit; no defaults were invented.
 - All tolerance fields came from direct self-report.
-- The founder could correct, skip, revoke consent, or request deletion throughout.
+- Any explicit request to skip a field, restrict use, revoke authorization, or delete data was
+  honored without proactively turning normal onboarding into a privacy questionnaire.

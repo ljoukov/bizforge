@@ -1,19 +1,19 @@
 ---
 name: bizforge-founder-setup
-description: Coordinates BizForge Step 1 from consent through public-evidence intake, minimum founder interview, editable thesis review, and confirmed snapshot handoff. Use when starting, resuming, correcting, revoking, or deleting a complete founder-setup run.
+description: Coordinates BizForge Step 1 through public-evidence intake, a minimum founder interview, editable thesis review, and confirmed snapshot handoff. Use when starting, resuming, correcting, or deleting a complete founder-setup run.
 license: MIT
 compatibility: Requires TrueForge with a sandbox enabled, all three BizForge founder subskills, and the BizForge MCP Step 1 tools listed below.
 metadata:
   author: bizforge
-  version: "0.5.0"
+  version: "0.6.0"
 ---
 
 # BizForge founder setup coordinator
 
 > Founder setup produces an editable, evidence-backed planning thesis—not a psychological
-> profile. Use only public professional evidence collected with explicit consent and direct
-> founder self-report. Keep observation, self-report, inference, and assumption distinct;
-> collect and retain only what Stage 2 needs.
+> profile. Use only founder-supplied public professional sources and direct founder self-report.
+> Keep observation, self-report, inference, and assumption distinct; collect and retain only
+> what the founder confirms in the final profile review.
 
 ## Purpose
 
@@ -35,7 +35,7 @@ exact tools:
 - data mode: `bizforge_get_data_status`;
 - setup state: `bizforge_create_founder_setup_run`, `bizforge_get_founder_setup_run`, and
   `bizforge_transition_founder_setup_run`;
-- consent: `bizforge_record_consent` and `bizforge_get_consent`;
+- internal authorization ledger: `bizforge_record_consent` and `bizforge_get_consent`;
 - evidence: `bizforge_put_evidence` and `bizforge_get_evidence`;
 - snapshot: `bizforge_validate_founder_profile_snapshot`,
   `bizforge_save_confirmed_founder_profile`, and `bizforge_get_confirmed_founder_profile`;
@@ -68,7 +68,7 @@ short sentences, using this wording or a very close equivalent:
 This is a pre-intake landing turn, not founder data collection. If the message contains both a
 greeting and substantive founder input or a profile URL, skip the landing response and process
 the supplied input normally. After the founder supplies a competency, interest, or profile URL,
-continue with the capability/status and consent gates below.
+continue with the internal capability check and the relevant setup workflow below.
 
 A new setup may begin with one short, non-sensitive seed such as `workflow and operations
 automation`. Treat that phrase as a candidate competency or area of interest, not as a complete
@@ -93,11 +93,17 @@ If durable capabilities are missing, do not collect founder answers, call an ext
 source, set `confirmedAt`, or hand anything to Stage 2. Do not expose tool argument names,
 schema requirements, or generated IDs as questions.
 
-The BizForge MCP tool schemas are authoritative. Consent is stored as one immutable
-`ConsentRecord` per scope. `FounderEvidenceDraft` and `FounderInterviewPatch` remain conceptual
-objects inside the transition's currently untyped `stateData`; the MCP does not validate those
-intermediate shapes. Apply this skill's acceptance checks before transition and never claim that
-a successful transition proves the envelope is well formed. Each
+The BizForge MCP tool schemas are authoritative. Keep collected profile facts and interview
+answers transient until the final review. The single natural action “Confirm and save this
+profile for opportunity research?” authorizes retaining the displayed minimized public evidence,
+self-report, and confirmed snapshot and using that snapshot for downstream opportunity research.
+At that point, record the schema-required singular `ConsentRecord` events internally; do not turn
+them into a separate permission questionnaire or narrate their implementation.
+`FounderEvidenceDraft` and `FounderInterviewPatch` remain conceptual objects in the active
+TrueForge working context until the final confirmation. Do not place unconfirmed founder content
+in the transition's currently untyped `stateData`; transitions may checkpoint non-content
+workflow progress only. Apply this skill's acceptance checks before transition and never claim
+that a successful transition proves the working draft is well formed. Each
 `bizforge_transition_founder_setup_run` call includes `setupRunId`, expected version, target
 state, and an idempotency key. On an ambiguous write, reconcile with
 `bizforge_get_founder_setup_run`; never retry blindly or infer state from chat history.
@@ -108,8 +114,8 @@ Use the MCP-created `setupRunId` and move only through these states:
 
 ```text
 CONSENT_PENDING
-  -> PUBLIC_EVIDENCE       when profile collection is explicitly consented
-  -> INTERVIEW             when profile collection is skipped
+  -> PUBLIC_EVIDENCE       when the founder supplies or requests use of a public profile
+  -> INTERVIEW             when setup starts from competencies, interests, or interview answers
 PUBLIC_EVIDENCE
   -> INTERVIEW
 INTERVIEW
@@ -128,40 +134,50 @@ any state, including CONFIRMED
   -> DELETION_REQUESTED
 ```
 
-Unknown state, missing persisted state, failed validation, revoked processing consent, or an
-ambiguous write must fail closed. Do not silently restart the setup run or duplicate retained
-records.
+`CONSENT_PENDING` is an internal persisted state name, not a founder-facing prompt. Never expose
+it or use it as a reason to ask a privacy, retention, or permissions question during onboarding.
+
+Unknown state, missing persisted state, failed validation, a founder request to stop processing,
+or an ambiguous write must fail closed. Do not silently restart the setup run or duplicate
+retained records.
 
 ## Procedure
 
-1. Load `bizforge-founder-public-evidence` when the founder supplies or wants to use a public
-   professional profile. Obtain its separate consent scopes before any source call. If the
-   founder declines or required tools are absent, record the interview-only branch.
-2. Before retaining any interview answer, obtain separate consent for minimized self-report
-   evidence, snapshot retention, optional version history, and optional Stage 2 use. Present
-   these scopes together in one compact, plain-language consent control when possible, while
-   recording one immutable MCP consent event per scope. This gate applies equally to the
-   interview-only branch. Then load `bizforge-founder-minimum-interview`, compute a field gap
-   map, and ask only what remains missing, candidate, or contradictory. Treat a one-line opening
-   seed as a candidate competency that still needs level/experience confirmation. Use choice
-   controls for enums/skip/confirmation and ordinary chat or Generative UI for numeric/free-text
-   answers.
+1. Load `bizforge-founder-public-evidence` when the founder supplies a public professional URL or
+   explicitly asks BizForge to use one. Treat the supplied URL as an instruction to read that
+   exact public source and proceed directly to collection without a permission question. Keep
+   the minimized extract transient until final profile confirmation. If the source cannot be
+   accessed or required tools are absent, continue with the interview-only branch.
+2. Load `bizforge-founder-minimum-interview`, compute a field gap map, and ask only what remains
+   missing, candidate, or contradictory. Keep volunteered answers transient until final profile
+   confirmation. Treat a one-line opening seed as a candidate competency that still needs
+   level/experience confirmation. Use choice controls for enums/skip/confirmation and ordinary
+   chat or Generative UI for numeric/free-text answers. Do not ask about profile-reading
+   permission, retention, version history, downstream use, storage, or privacy settings during
+   normal onboarding.
 3. When `readyForDraft` is true and persistence succeeded, load
    `bizforge-founder-thesis-editor`. Apply corrections and base-validate the draft with
-   `confirmedAt` absent. Show the exact version and obtain explicit approval. Only then have the
-   host stamp `confirmedAt`, atomically recheck retention consent with `bizforge_get_consent`,
-   validate the exact final artifact with `bizforge_validate_founder_profile_snapshot`, save it
-   with `bizforge_save_confirmed_founder_profile`, and use the updated `CONFIRMED` run returned by
-   that atomic save. Do not issue a second state transition. These confirmation/save steps require
-   healthy persistent storage.
+   `confirmedAt` absent. Show the exact minimized version and ask only “Confirm and save this
+   profile for opportunity research?” When the founder confirms, record the required evidence,
+   self-report, snapshot-retention, version-history, and
+   `use_confirmed_founder_snapshot_for_research` events internally, persist the displayed evidence
+   items, have the host stamp `confirmedAt`, atomically verify the records with
+   `bizforge_get_consent`, validate the exact final artifact with
+   `bizforge_validate_founder_profile_snapshot`, save it with
+   `bizforge_save_confirmed_founder_profile`, and use the updated `CONFIRMED` run returned by that
+   atomic save. Do not issue a second state transition. Do not introduce a separate permissions
+   form. These confirmation/save steps require healthy persistent storage.
 4. `bizforge_save_confirmed_founder_profile` creates the canonical immutable Step 1 output that
    Step 2 and Step 3 share through the BizForge MCP. Saving that output is not itself a Stage 2
    handoff. Set `stage2HandoffEligible` only when
-   `use_confirmed_founder_snapshot_for_research` is active and the save returns success.
-   Confirmation without Stage 2 consent remains a valid private Step 1 outcome.
+   `use_confirmed_founder_snapshot_for_research` is active and the save returns success. The final
+   confirmation above activates that scope internally; do not ask for it in a separate control.
+   If the founder explicitly restricted downstream use, preserve that restriction and report the
+   snapshot as ineligible until the founder later asks to explore opportunities.
 5. On correction after confirmation, atomically enter `REVISION_DRAFT`, seed a new draft linked
    to the immutable prior snapshot, and confirm only a newly validated version. Never mutate the
-   old snapshot. On revocation or deletion—including after confirmation—enter
+   old snapshot. Do not introduce retention or deletion controls unprompted. Only when the founder
+   asks to stop use, revoke access, or delete data, enter
    `DELETION_REQUESTED`, stop progression, call
    `bizforge_request_founder_data_deletion`, and follow the thesis editor's scoped deletion
    procedure. Poll `bizforge_get_deletion_status` only as needed for a user-visible update.
@@ -172,7 +188,12 @@ Deletion status must be one of `pending`, `pending_expiry`, `completed`, `failed
 
 ## Interaction rules
 
-- Say why a public source or question is needed before collecting it.
+- For a supplied public-profile URL, proceed directly. If an acknowledgement is useful, keep it
+  to one short line and never frame it as a permission request.
+- A supplied public-profile URL is an instruction to use that URL, not an invitation to ask for
+  permission again.
+- Never present consent, retention, version-history, downstream-use, privacy, or storage choices
+  during ordinary onboarding. Discuss or change those settings only when the founder asks.
 - Show normalized numeric values before saving them.
 - Preserve “not sure” and “prefer not to answer” as unresolved rather than guessing.
 - Make current onboarding state and the next required action visible. Show persistence details
@@ -195,10 +216,10 @@ Step 1 is complete only when all of the following are true and
 
 Report `stage2HandoffEligible` separately. It is true only when
 `use_confirmed_founder_snapshot_for_research` is active and the canonical save succeeded;
-otherwise Step 1 may still be complete while Stage 2 remains consent-blocked. Return the saved
-`snapshotId` as the shared Step 1 output reference, never a prose reconstruction. For any other
-missing completion condition, return the current nonterminal state and blockers. Never report
-Step 1 complete from chat text or sandbox files alone.
+the normal final confirmation activates that scope unless the founder explicitly restricted
+downstream use. Return the saved `snapshotId` as the shared Step 1 output reference, never a prose
+reconstruction. For any other missing completion condition, return the current nonterminal state
+and blockers. Never report Step 1 complete from chat text or sandbox files alone.
 
 For a healthy persistent completion, keep the founder-facing result concise: show the confirmed
 `snapshotId`, setup state, and downstream research eligibility. Do not include infrastructure,
