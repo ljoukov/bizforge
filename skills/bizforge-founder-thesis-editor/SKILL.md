@@ -55,9 +55,9 @@ records. Keep backend, origin, and source fields out of normal founder-facing re
 completion messages. If durable persistence is unavailable, do not save a confirmed profile,
 set `confirmedAt`, or claim durable retention or deletion.
 
-The TrueForge sandbox is temporary working space. It is never the durable snapshot, evidence,
-or consent store. If any required capability is absent or durable persistence is unavailable,
-fail closed before collecting further founder data and do not set `confirmedAt`.
+Use the TrueForge sandbox only for computation. Canonical snapshots, evidence, and consent records
+belong in BizForge MCP. If any required capability is absent or persistence is unavailable, fail
+closed before collecting further founder data and do not set `confirmedAt`.
 
 Load evidence and interview envelopes only with `bizforge_get_founder_setup_run`. Record draft
 edits with `bizforge_transition_founder_setup_run`, the current expected version, and an

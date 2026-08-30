@@ -3,7 +3,7 @@
 ## Shared stage boundary
 
 All three stages exchange canonical artifacts through one application-owned MCP server. Chat
-text and temporary Daytona files are never handoff records.
+text and Daytona scratch files are never handoff records.
 
 ```text
 Stage 1 setup agent
@@ -14,9 +14,9 @@ Stage 1 setup agent
 ```
 
 `BizForgeDataStore` separates persistence from protocol and domain validation. The production
-adapter is SQLite, and every configured MCP runtime opens a persistent SQLite database. Synthetic
-builders and in-memory stores are limited to test fixtures and are not exported by the production
-server or package entrypoint.
+adapter is SQLite, and every configured MCP runtime opens a persistent SQLite database. Test-only
+builders and in-memory stores are confined to automated tests and are not exported by the
+production server or package entrypoint.
 
 The MCP endpoint uses Streamable HTTP on loopback with Host/Origin validation. Step 1 receives
 the setup, consent, evidence, confirmation and deletion tools; Step 2 receives the bundle write

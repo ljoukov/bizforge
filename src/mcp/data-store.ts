@@ -14,7 +14,6 @@ import {
   type ConsentRecord,
   ConsentRecordSchema,
   type ConsentScope,
-  type DataSource,
   DataSourceSchema,
   type DataStoreStatus,
   DataStoreStatusSchema,
@@ -60,8 +59,6 @@ export interface ConfirmFounderProfileInput {
   readonly expectedVersion: number;
   readonly idempotencyKey: string;
   readonly profile: ConfirmedFounderProfileSnapshot;
-  readonly isSynthetic: boolean;
-  readonly source?: DataSource;
 }
 
 export interface ConfirmFounderProfileResult {
@@ -84,30 +81,19 @@ export interface BizForgeDataStore {
     founderId?: string;
     setupRunId?: string;
     clientRequestId?: string;
-    source?: DataSource;
-    isSynthetic: boolean;
     now?: string;
   }): StoredRecordWithRun;
   getSetupRun(setupRunId: string): StoredRecordWithRun | undefined;
   transitionSetupRun(input: TransitionSetupRunInput): TransitionSetupRunResult;
-  recordConsent(record: ConsentRecord, source?: DataSource): StoredRecordWithConsent;
+  recordConsent(record: ConsentRecord): StoredRecordWithConsent;
   getConsent(setupRunId: string, scope?: ConsentScope): StoredRecordWithConsent[];
-  putEvidence(
-    setupRunId: string,
-    evidence: EvidenceItem,
-    source?: DataSource,
-    isSynthetic?: boolean,
-  ): StoredEvidenceRecord<EvidenceItem>;
+  putEvidence(setupRunId: string, evidence: EvidenceItem): StoredEvidenceRecord<EvidenceItem>;
   getEvidence(evidenceId: string): StoredEvidenceRecord<EvidenceItem> | undefined;
   confirmFounderProfile(input: ConfirmFounderProfileInput): ConfirmFounderProfileResult;
   getFounderProfile(
     snapshotId: string,
   ): StoredFounderProfileRecord<ConfirmedFounderProfileSnapshot> | undefined;
-  saveResearchBundle(
-    bundle: ResearchBundle,
-    source: DataSource,
-    isSynthetic: boolean,
-  ): StoredResearchBundleRecord<ResearchBundle>;
+  saveResearchBundle(bundle: ResearchBundle): StoredResearchBundleRecord<ResearchBundle>;
   getResearchBundle(
     bundleId: string,
     version?: number,
@@ -207,8 +193,119 @@ export interface BizForgeDataStoreSnapshot {
   readonly historyCleanupCompletedGeneration: number;
 }
 
+// Snapshots written before the persistent-only contract cleanup duplicated
+// adapter-mode markers onto the snapshot and every stored record. They are
+// accepted only when every marker proves the record came from the persistent
+// MCP path, then stripped before current-schema validation. Any partial,
+// alternate, or contradictory marker set fails closed.
+const LegacyPersistentStatusSchema = z
+  .object({
+    dataMode: z.literal("persistent"),
+    storageMode: z.literal("persistent"),
+    storageBackend: z.string().min(1),
+    persistenceStatus: z.literal("persistent"),
+    isMock: z.literal(false),
+    ephemeral: z.literal(false),
+    writePolicy: z
+      .object({
+        requiresExplicitMockAcceptance: z.literal(false),
+        acceptsNonSyntheticWrites: z.literal(true),
+      })
+      .strict(),
+    fixtureVersion: z.literal("not-applicable"),
+    warnings: z.array(z.string().min(1)),
+  })
+  .passthrough();
+
+const LegacyPersistentRecordSchema = LegacyPersistentStatusSchema.extend({
+  isSynthetic: z.literal(false),
+  source: z.literal("mcp_write"),
+});
+
+const legacyStatusMarkerKeys = ["isMock", "ephemeral", "writePolicy", "fixtureVersion"] as const;
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(value, key);
+}
+
+function stripLegacyStatusMarkers(input: unknown): unknown {
+  if (!isObjectRecord(input)) return input;
+  if (!legacyStatusMarkerKeys.some((key) => hasOwn(input, key))) return input;
+  const parsed = LegacyPersistentStatusSchema.parse(input);
+  const { isMock, ephemeral, writePolicy, fixtureVersion, ...current } = parsed;
+  void isMock;
+  void ephemeral;
+  void writePolicy;
+  void fixtureVersion;
+  return current;
+}
+
+function stripLegacyRecordMarkers(input: unknown): unknown {
+  if (!isObjectRecord(input)) return input;
+  const hasLegacyMarkers =
+    hasOwn(input, "isSynthetic") || legacyStatusMarkerKeys.some((key) => hasOwn(input, key));
+  if (!hasLegacyMarkers) return input;
+  const parsed = LegacyPersistentRecordSchema.parse(input);
+  const { isMock, ephemeral, writePolicy, fixtureVersion, isSynthetic, ...current } = parsed;
+  void isMock;
+  void ephemeral;
+  void writePolicy;
+  void fixtureVersion;
+  void isSynthetic;
+  return current;
+}
+
+function migrateStoredRecordEntries(input: unknown): unknown {
+  if (!Array.isArray(input)) return input;
+  return input.map((entry) =>
+    Array.isArray(entry) && entry.length === 2
+      ? [entry[0], stripLegacyRecordMarkers(entry[1])]
+      : entry,
+  );
+}
+
+function migrateLegacySnapshotMarkers(input: unknown): unknown {
+  if (!isObjectRecord(input)) return input;
+  const migrated: Record<string, unknown> = {
+    ...input,
+    dataStatus: stripLegacyStatusMarkers(input.dataStatus),
+  };
+  for (const field of ["runs", "consents", "evidence", "profiles", "bundles", "deletions"])
+    migrated[field] = migrateStoredRecordEntries(input[field]);
+
+  if (Array.isArray(input.confirmationKeys)) {
+    migrated.confirmationKeys = input.confirmationKeys.map((entry) => {
+      if (!Array.isArray(entry) || entry.length !== 2 || !isObjectRecord(entry[1])) return entry;
+      const confirmation = entry[1];
+      if (confirmation.status !== "replayable" || !isObjectRecord(confirmation.result))
+        return entry;
+      return [
+        entry[0],
+        {
+          ...confirmation,
+          result: {
+            ...confirmation.result,
+            profile: stripLegacyRecordMarkers(confirmation.result.profile),
+          },
+        },
+      ];
+    });
+  }
+
+  if (Array.isArray(input.deletionKeys)) {
+    migrated.deletionKeys = input.deletionKeys.map((entry) => {
+      if (!Array.isArray(entry) || entry.length !== 2 || !isObjectRecord(entry[1])) return entry;
+      return [entry[0], { ...entry[1], record: stripLegacyRecordMarkers(entry[1].record) }];
+    });
+  }
+  return migrated;
+}
+
 const RecordOriginSchema = DataStoreStatusSchema.extend({
-  isSynthetic: z.boolean(),
   source: DataSourceSchema,
 });
 const StoredRunSchema = RecordOriginSchema.extend({ value: FounderSetupRunSchema });
@@ -239,7 +336,7 @@ function uniqueEntryKeys(entries: readonly (readonly [string, unknown])[]): bool
   return new Set(entries.map(([key]) => key)).size === entries.length;
 }
 
-export const BizForgeDataStoreSnapshotSchema = z
+const CurrentBizForgeDataStoreSnapshotSchema = z
   .object({
     schemaVersion: z.literal("1.0.0"),
     dataStatus: DataStoreStatusSchema,
@@ -368,6 +465,11 @@ export const BizForgeDataStoreSnapshotSchema = z
     }
   });
 
+export const BizForgeDataStoreSnapshotSchema = z.preprocess(
+  migrateLegacySnapshotMarkers,
+  CurrentBizForgeDataStoreSnapshotSchema,
+);
+
 const allowedTransitions: Readonly<Record<FounderSetupState, readonly FounderSetupState[]>> = {
   CONSENT_PENDING: ["PUBLIC_EVIDENCE", "INTERVIEW", "DELETION_REQUESTED"],
   PUBLIC_EVIDENCE: ["INTERVIEW", "DELETION_REQUESTED"],
@@ -380,25 +482,6 @@ const allowedTransitions: Readonly<Record<FounderSetupState, readonly FounderSet
 
 function clone<T>(value: T): T {
   return structuredClone(value);
-}
-
-function mockDataStatus(): DataStoreStatus {
-  return {
-    dataMode: "mock",
-    storageMode: "mock",
-    storageBackend: "memory",
-    persistenceStatus: "mock_ephemeral",
-    isMock: true,
-    ephemeral: true,
-    writePolicy: {
-      requiresExplicitMockAcceptance: true,
-      acceptsNonSyntheticWrites: false,
-    },
-    fixtureVersion: "synthetic-v1",
-    warnings: [
-      "Mock in-memory storage is ephemeral and all data is lost when the MCP process restarts.",
-    ],
-  };
 }
 
 function signature(value: unknown): string {
@@ -539,10 +622,6 @@ function statusFromOrigin(origin: RecordOrigin): DataStoreStatus {
     storageMode: origin.storageMode,
     storageBackend: origin.storageBackend,
     persistenceStatus: origin.persistenceStatus,
-    isMock: origin.isMock,
-    ephemeral: origin.ephemeral,
-    writePolicy: clone(origin.writePolicy),
-    fixtureVersion: origin.fixtureVersion,
     warnings: clone(origin.warnings),
   };
 }
@@ -987,7 +1066,8 @@ function assertSnapshotInvariants(
   }
 }
 
-export class InMemoryBizForgeDataStore implements BizForgeDataStore {
+/** @internal Mutable domain state used only inside the SQLite transaction boundary. */
+export class BizForgeStateStore implements BizForgeDataStore {
   readonly #runs = new Map<string, StoredRecordWithRun>();
   readonly #consents = new Map<string, StoredRecordWithConsent>();
   readonly #evidence = new Map<string, StoredEvidenceRecord<EvidenceItem>>();
@@ -1011,10 +1091,8 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
   #historyCleanupCompletedGeneration = 0;
   readonly #dataStatus: DataStoreStatus;
 
-  constructor(options?: {
-    dataStatus?: DataStoreStatus;
-  }) {
-    this.#dataStatus = DataStoreStatusSchema.parse(options?.dataStatus ?? mockDataStatus());
+  constructor(dataStatus: DataStoreStatus) {
+    this.#dataStatus = DataStoreStatusSchema.parse(dataStatus);
   }
 
   getDataStatus(): DataStoreStatus {
@@ -1128,16 +1206,21 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     this.#historyCleanupCompletedGeneration = snapshot.historyCleanupCompletedGeneration;
   }
 
-  #origin(source: DataSource, isSynthetic = source === "mock_seed"): RecordOrigin {
-    return { ...this.getDataStatus(), isSynthetic, source };
+  #origin(): RecordOrigin {
+    return { ...this.getDataStatus(), source: "mcp_write" };
   }
 
-  #assertWriteOriginSupported(isSynthetic: boolean): void {
-    if (!isSynthetic && !this.getDataStatus().writePolicy.acceptsNonSyntheticWrites) {
-      throw new BizForgeStoreError(
-        "non_synthetic_writes_unsupported",
-        "The active storage adapter accepts synthetic records only",
-      );
+  #assertCurrentRecordOrigin(origin: RecordOrigin): void {
+    const result = RecordOriginSchema.safeParse({
+      dataMode: origin.dataMode,
+      storageMode: origin.storageMode,
+      storageBackend: origin.storageBackend,
+      persistenceStatus: origin.persistenceStatus,
+      warnings: origin.warnings,
+      source: origin.source,
+    });
+    if (!result.success) {
+      throw new BizForgeStoreError("record_origin_mismatch", "Stored record origin is invalid");
     }
   }
 
@@ -1145,20 +1228,17 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     founderId?: string;
     setupRunId?: string;
     clientRequestId?: string;
-    source?: DataSource;
-    isSynthetic: boolean;
     now?: string;
   }): StoredRecordWithRun {
     if (input.clientRequestId !== undefined) {
       assertNonBlankRequestKey(input.clientRequestId, "clientRequestId");
     }
-    const requestedSynthetic = input.isSynthetic;
-    const source = input.source ?? "mcp_write";
     const requestSignatureSha256 = signatureSha256({
       founderId: input.founderId ?? null,
       setupRunId: input.setupRunId ?? null,
-      source,
-      isSynthetic: requestedSynthetic,
+      // Preserve pre-cleanup receipt signatures for exact retries.
+      source: "mcp_write",
+      isSynthetic: false,
       now: input.now ?? null,
     });
     if (input.clientRequestId !== undefined) {
@@ -1183,12 +1263,11 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
             "The setup run for this clientRequestId no longer exists",
           );
         }
-        this.#assertWriteOriginSupported(replayedRun.isSynthetic);
+        this.#assertCurrentRecordOrigin(replayedRun);
         return clone(replayedRun);
       }
     }
 
-    this.#assertWriteOriginSupported(requestedSynthetic);
     const setupRunId = input.setupRunId ?? `setup-${randomUUID()}`;
     if (this.#deletedSetupRunIds.has(setupRunId)) {
       throw new BizForgeStoreError(
@@ -1198,16 +1277,11 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     }
     const existing = this.#runs.get(setupRunId);
     if (existing !== undefined) {
+      this.#assertCurrentRecordOrigin(existing);
       if (input.founderId !== undefined && existing.value.founderId !== input.founderId) {
         throw new BizForgeStoreError(
           "setup_run_conflict",
           `Setup run ${setupRunId} already belongs to another founder`,
-        );
-      }
-      if (existing.isSynthetic !== requestedSynthetic) {
-        throw new BizForgeStoreError(
-          "synthetic_origin_mismatch",
-          `Setup run ${setupRunId} synthetic origin does not match the request`,
         );
       }
       if (input.clientRequestId !== undefined) {
@@ -1232,7 +1306,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       createdAt: now,
       updatedAt: now,
     });
-    const record = { value, ...this.#origin(source, requestedSynthetic) };
+    const record = { value, ...this.#origin() };
     this.#runs.set(setupRunId, record);
     if (input.clientRequestId !== undefined) {
       this.#creationKeys.set(input.clientRequestId, {
@@ -1264,7 +1338,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       );
     }
     const stored = requireRun(this.#runs, input.setupRunId);
-    this.#assertWriteOriginSupported(stored.isSynthetic);
+    this.#assertCurrentRecordOrigin(stored);
     const key = scopedIdempotencyKey(input.setupRunId, input.idempotencyKey);
     const requestSignatureSha256 = signatureSha256(input);
     const replay = this.#transitionKeys.get(key);
@@ -1325,10 +1399,10 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     return { run: clone(run), replayed: false };
   }
 
-  recordConsent(record: ConsentRecord, source: DataSource = "mcp_write"): StoredRecordWithConsent {
+  recordConsent(record: ConsentRecord): StoredRecordWithConsent {
     const parsed = ConsentRecordSchema.parse(record);
     const run = requireRun(this.#runs, parsed.setupRunId);
-    this.#assertWriteOriginSupported(run.isSynthetic);
+    this.#assertCurrentRecordOrigin(run);
     if (run.value.founderId !== parsed.founderId) {
       throw new BizForgeStoreError(
         "founder_mismatch",
@@ -1361,7 +1435,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       historyCleanupGeneration: this.#historyCleanupGeneration,
       historyCleanupCompletedGeneration: this.#historyCleanupCompletedGeneration,
     };
-    const stored = existing ?? { value: parsed, ...this.#origin(source, run.isSynthetic) };
+    const stored = existing ?? { value: parsed, ...this.#origin() };
     try {
       if (existing === undefined) {
         this.#consentOrder.set(parsed.consentId, this.#nextConsentOrder);
@@ -1588,55 +1662,36 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     const downstreamConsentActive =
       this.#hasActiveConsent(setupRunId, "retain_minimized_founder_snapshot") &&
       this.#hasActiveConsent(setupRunId, "use_confirmed_founder_snapshot_for_research");
-    const isMockStore = this.getDataStatus().isMock;
     return {
-      stage2HandoffEligible: !isMockStore && isCanonical && downstreamConsentActive,
+      stage2HandoffEligible: isCanonical && downstreamConsentActive,
     };
   }
 
-  #storeEvidence(
-    setupRunId: string,
-    evidence: EvidenceItem,
-    source: DataSource,
-    isSynthetic: boolean,
-  ): StoredEvidenceRecord<EvidenceItem> {
+  #storeEvidence(setupRunId: string, evidence: EvidenceItem): StoredEvidenceRecord<EvidenceItem> {
     evidenceConsentScope(evidence);
     const existing = this.#evidence.get(evidence.evidenceId);
     if (
       existing !== undefined &&
-      (existing.setupRunId !== setupRunId ||
-        existing.isSynthetic !== isSynthetic ||
-        signature(existing.value) !== signature(evidence))
+      (existing.setupRunId !== setupRunId || signature(existing.value) !== signature(evidence))
     ) {
       throw new BizForgeStoreError(
         "evidence_conflict",
         `Evidence ${evidence.evidenceId} already exists with different content or ownership`,
       );
     }
+    if (existing !== undefined) this.#assertCurrentRecordOrigin(existing);
     const stored = existing ?? {
       setupRunId,
       value: clone(evidence),
-      ...this.#origin(source, isSynthetic),
+      ...this.#origin(),
     };
     this.#evidence.set(evidence.evidenceId, stored);
     return clone(stored);
   }
 
-  putEvidence(
-    setupRunId: string,
-    evidence: EvidenceItem,
-    source: DataSource = "mcp_write",
-    isSynthetic?: boolean,
-  ): StoredEvidenceRecord<EvidenceItem> {
+  putEvidence(setupRunId: string, evidence: EvidenceItem): StoredEvidenceRecord<EvidenceItem> {
     const run = requireRun(this.#runs, setupRunId);
-    const recordIsSynthetic = isSynthetic ?? run.isSynthetic;
-    this.#assertWriteOriginSupported(recordIsSynthetic);
-    if (recordIsSynthetic !== run.isSynthetic) {
-      throw new BizForgeStoreError(
-        "synthetic_origin_mismatch",
-        "Evidence synthetic origin must match its setup run",
-      );
-    }
+    this.#assertCurrentRecordOrigin(run);
     const requiredScope = evidenceConsentScope(evidence);
     if (!this.#hasActiveConsent(setupRunId, requiredScope)) {
       throw new BizForgeStoreError(
@@ -1644,7 +1699,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
         `Active ${requiredScope} consent is required to store this evidence`,
       );
     }
-    return this.#storeEvidence(setupRunId, evidence, source, recordIsSynthetic);
+    return this.#storeEvidence(setupRunId, evidence);
   }
 
   getEvidence(evidenceId: string): StoredEvidenceRecord<EvidenceItem> | undefined {
@@ -1653,7 +1708,6 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
   }
 
   confirmFounderProfile(input: ConfirmFounderProfileInput): ConfirmFounderProfileResult {
-    this.#assertWriteOriginSupported(input.isSynthetic);
     const key = scopedIdempotencyKey(input.setupRunId, input.idempotencyKey);
     const requestedProfile = ConfirmedFounderProfileSnapshotSchema.parse(input.profile);
     if (this.#withdrawnProfileSnapshotIds.has(requestedProfile.snapshotId)) {
@@ -1667,7 +1721,8 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       expectedVersion: input.expectedVersion,
       idempotencyKey: input.idempotencyKey,
       profile: requestedProfile,
-      isSynthetic: input.isSynthetic,
+      // Preserve pre-cleanup receipt signatures for exact retries.
+      isSynthetic: false,
     });
     const replay = this.#confirmationKeys.get(key);
     if (replay !== undefined) {
@@ -1692,6 +1747,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
           "The idempotency key was already used with a different founder snapshot",
         );
       }
+      this.#assertCurrentRecordOrigin(replay.result.profile);
       const liveEligibility = this.#confirmationEligibility(
         input.setupRunId,
         replay.result.profile.value.snapshotId,
@@ -1702,13 +1758,8 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     }
 
     const storedRun = requireRun(this.#runs, input.setupRunId);
+    this.#assertCurrentRecordOrigin(storedRun);
     assertVersion(storedRun.value, input.expectedVersion);
-    if (input.isSynthetic !== storedRun.isSynthetic) {
-      throw new BizForgeStoreError(
-        "synthetic_origin_mismatch",
-        "Founder snapshot synthetic origin must match its setup run",
-      );
-    }
     if (storedRun.value.founderId !== requestedProfile.founderId) {
       throw new BizForgeStoreError(
         "founder_mismatch",
@@ -1728,12 +1779,10 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
         "Active retain_minimized_founder_snapshot consent is required",
       );
     }
-    const profile = input.isSynthetic
-      ? requestedProfile
-      : ConfirmedFounderProfileSnapshotSchema.parse({
-          ...requestedProfile,
-          snapshotId: `snapshot-${randomUUID()}`,
-        });
+    const profile = ConfirmedFounderProfileSnapshotSchema.parse({
+      ...requestedProfile,
+      snapshotId: `snapshot-${randomUUID()}`,
+    });
     if (
       this.#profiles.has(profile.snapshotId) ||
       this.#withdrawnProfileSnapshotIds.has(profile.snapshotId)
@@ -1745,16 +1794,13 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     }
     for (const evidenceId of profile.sourceEvidenceIds) {
       const evidence = this.#evidence.get(evidenceId);
-      if (
-        evidence === undefined ||
-        evidence.setupRunId !== input.setupRunId ||
-        evidence.isSynthetic !== input.isSynthetic
-      ) {
+      if (evidence === undefined || evidence.setupRunId !== input.setupRunId) {
         throw new BizForgeStoreError(
           "evidence_not_found",
           `Founder evidence ${evidenceId} is missing from this setup run`,
         );
       }
+      this.#assertCurrentRecordOrigin(evidence);
     }
 
     const existing = this.#profiles.get(profile.snapshotId);
@@ -1789,7 +1835,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       const storedProfile = {
         setupRunId: input.setupRunId,
         value: clone(profile),
-        ...this.#origin(input.source ?? "mcp_write", input.isSynthetic),
+        ...this.#origin(),
       };
       this.#profiles.set(profile.snapshotId, storedProfile);
       this.#currentProfileSnapshotIds.set(input.setupRunId, profile.snapshotId);
@@ -1856,12 +1902,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     );
   }
 
-  saveResearchBundle(
-    input: ResearchBundle,
-    source: DataSource,
-    isSynthetic: boolean,
-  ): StoredResearchBundleRecord<ResearchBundle> {
-    this.#assertWriteOriginSupported(isSynthetic);
+  saveResearchBundle(input: ResearchBundle): StoredResearchBundleRecord<ResearchBundle> {
     const bundle = ResearchBundleSchema.parse(input);
     assertResearchBundleEvidenceValid(bundle);
     const referencedIds = referencedEvidenceIds(bundle);
@@ -1882,12 +1923,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
         "Research bundle must reference an identical stored confirmed founder snapshot",
       );
     }
-    if (profile.isSynthetic !== isSynthetic) {
-      throw new BizForgeStoreError(
-        "synthetic_origin_mismatch",
-        "Research bundle synthetic origin must match its founder snapshot",
-      );
-    }
+    this.#assertCurrentRecordOrigin(profile);
     if (this.#currentProfileSnapshotIds.get(profile.setupRunId) !== profile.value.snapshotId) {
       throw new BizForgeStoreError(
         "founder_snapshot_superseded",
@@ -1924,6 +1960,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     }
     const key = `${bundle.bundleId}:${bundle.bundleVersion}`;
     const existing = this.#bundles.get(key);
+    if (existing !== undefined) this.#assertCurrentRecordOrigin(existing);
     if (existing !== undefined && signature(existing.value) !== signature(bundle)) {
       throw new BizForgeStoreError(
         "research_bundle_conflict",
@@ -1936,12 +1973,12 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     };
     try {
       for (const evidence of bundle.evidence) {
-        this.#storeEvidence(profile.setupRunId, evidence, source, isSynthetic);
+        this.#storeEvidence(profile.setupRunId, evidence);
       }
       const stored = existing ?? {
         setupRunId: profile.setupRunId,
         value: clone(bundle),
-        ...this.#origin(source, isSynthetic),
+        ...this.#origin(),
       };
       this.#bundles.set(key, stored);
       return clone(stored);
@@ -2008,7 +2045,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     const requestSignature = signature(input);
     const replay = this.#deletionKeys.get(key);
     if (replay !== undefined) {
-      this.#assertWriteOriginSupported(replay.record.isSynthetic);
+      this.#assertCurrentRecordOrigin(replay.record);
       if (replay.signature !== requestSignature) {
         throw new BizForgeStoreError(
           "idempotency_conflict",
@@ -2018,7 +2055,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
       return clone(replay.record);
     }
     const run = requireRun(this.#runs, input.setupRunId);
-    this.#assertWriteOriginSupported(run.isSynthetic);
+    this.#assertCurrentRecordOrigin(run);
     if (run.value.founderId !== input.founderId) {
       throw new BizForgeStoreError(
         "founder_mismatch",
@@ -2094,65 +2131,32 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
 
     const now = new Date().toISOString();
     const dataStatus = this.getDataStatus();
-    const systems = dataStatus.isMock
-      ? [
-          {
-            system: "in_memory_store",
-            status: "completed" as const,
-            reason: `Removed ${removed} controllable in-memory records for setup run ${input.setupRunId}`,
-            checkedAt: now,
-          },
-          {
-            system: "durable_artifact_store",
-            status: "unverifiable" as const,
-            reason: "The mock adapter has no durable artifact store to inspect",
-            checkedAt: now,
-          },
-          {
-            system: "trueforge_session_transcripts",
-            status: "unverifiable" as const,
-            reason: "TrueForge transcript deletion is outside this mock adapter",
-            checkedAt: now,
-          },
-          {
-            system: "external_providers",
-            status: "unverifiable" as const,
-            reason: "Provider-side retention cannot be verified by this mock adapter",
-            checkedAt: now,
-          },
-          {
-            system: "backups",
-            status: "pending_expiry" as const,
-            reason: "No documented backup-expiry confirmation is available in the mock adapter",
-            checkedAt: now,
-          },
-        ]
-      : [
-          {
-            system: `${dataStatus.storageBackend}_store`,
-            status: "pending" as const,
-            reason: `Removed ${removed} records for setup run ${input.setupRunId} from the domain snapshot; durable storage finalization is pending`,
-            checkedAt: now,
-          },
-          {
-            system: "trueforge_session_transcripts",
-            status: "unverifiable" as const,
-            reason: "TrueForge transcript deletion is outside this storage adapter",
-            checkedAt: now,
-          },
-          {
-            system: "external_providers",
-            status: "unverifiable" as const,
-            reason: "Provider-side retention cannot be verified by this storage adapter",
-            checkedAt: now,
-          },
-          {
-            system: "backups",
-            status: "pending_expiry" as const,
-            reason: "Independently managed backups remain subject to their retention policy",
-            checkedAt: now,
-          },
-        ];
+    const systems = [
+      {
+        system: `${dataStatus.storageBackend}_store`,
+        status: "pending" as const,
+        reason: `Removed ${removed} records for setup run ${input.setupRunId} from the domain snapshot; durable storage finalization is pending`,
+        checkedAt: now,
+      },
+      {
+        system: "trueforge_session_transcripts",
+        status: "unverifiable" as const,
+        reason: "TrueForge transcript deletion is outside this storage adapter",
+        checkedAt: now,
+      },
+      {
+        system: "external_providers",
+        status: "unverifiable" as const,
+        reason: "Provider-side retention cannot be verified by this storage adapter",
+        checkedAt: now,
+      },
+      {
+        system: "backups",
+        status: "pending_expiry" as const,
+        reason: "Independently managed backups remain subject to their retention policy",
+        checkedAt: now,
+      },
+    ];
     const deletion: DeletionRecord = {
       deletionRequestId: `deletion-${randomUUID()}`,
       setupRunId: input.setupRunId,
@@ -2164,7 +2168,7 @@ export class InMemoryBizForgeDataStore implements BizForgeDataStore {
     };
     const stored = {
       value: deletion,
-      ...this.#origin("mcp_write", run.isSynthetic),
+      ...this.#origin(),
     };
     this.#deletions.set(deletion.deletionRequestId, stored);
     this.#deletionKeys.set(key, { signature: requestSignature, record: stored });

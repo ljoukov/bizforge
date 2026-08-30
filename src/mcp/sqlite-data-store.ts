@@ -10,7 +10,6 @@ import type { ResearchBundle } from "../domain/research-bundle.js";
 import type {
   ConsentRecord,
   ConsentScope,
-  DataSource,
   DataStoreStatus,
   DeletionRecord,
   DeletionSystemStatus,
@@ -21,10 +20,10 @@ import type {
 } from "./contracts.js";
 import {
   type BizForgeDataStore,
+  BizForgeStateStore,
   BizForgeStoreError,
   type ConfirmFounderProfileInput,
   type ConfirmFounderProfileResult,
-  InMemoryBizForgeDataStore,
   type RequestDeletionInput,
   type StoredRecordWithConsent,
   type StoredRecordWithRun,
@@ -53,13 +52,6 @@ function sqliteStatus(): DataStoreStatus {
     storageMode: "persistent",
     storageBackend: "sqlite",
     persistenceStatus: "persistent",
-    isMock: false,
-    ephemeral: false,
-    writePolicy: {
-      requiresExplicitMockAcceptance: false,
-      acceptsNonSyntheticWrites: true,
-    },
-    fixtureVersion: "not-applicable",
     warnings: [],
   };
 }
@@ -73,7 +65,7 @@ type CreateSetupRunInput = Parameters<BizForgeDataStore["createSetupRun"]>[0];
 /**
  * Persistent, concurrency-safe BizForge storage backed by a single revisioned
  * and checksummed state snapshot. Domain logic remains centralized in
- * `InMemoryBizForgeDataStore`; SQLite supplies the lock and durability boundary.
+ * `BizForgeStateStore`; SQLite supplies the lock and durability boundary.
  */
 export class SqliteBizForgeDataStore implements BizForgeDataStore {
   readonly #database: DatabaseSync;
@@ -137,8 +129,8 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
     return this.#mutate((store) => store.transitionSetupRun(input));
   }
 
-  recordConsent(record: ConsentRecord, source: DataSource = "mcp_write"): StoredRecordWithConsent {
-    return this.#mutate((store) => store.recordConsent(record, source));
+  recordConsent(record: ConsentRecord): StoredRecordWithConsent {
+    return this.#mutate((store) => store.recordConsent(record));
   }
 
   getConsent(setupRunId: string, scope?: ConsentScope): StoredRecordWithConsent[] {
@@ -146,13 +138,8 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
     return this.#loadDomainStore().getConsent(setupRunId, scope);
   }
 
-  putEvidence(
-    setupRunId: string,
-    evidence: EvidenceItem,
-    source: DataSource = "mcp_write",
-    isSynthetic?: boolean,
-  ): StoredEvidenceRecord<EvidenceItem> {
-    return this.#mutate((store) => store.putEvidence(setupRunId, evidence, source, isSynthetic));
+  putEvidence(setupRunId: string, evidence: EvidenceItem): StoredEvidenceRecord<EvidenceItem> {
+    return this.#mutate((store) => store.putEvidence(setupRunId, evidence));
   }
 
   getEvidence(evidenceId: string): StoredEvidenceRecord<EvidenceItem> | undefined {
@@ -171,12 +158,8 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
     return this.#loadDomainStore().getFounderProfile(snapshotId);
   }
 
-  saveResearchBundle(
-    bundle: ResearchBundle,
-    source: DataSource,
-    isSynthetic: boolean,
-  ): StoredResearchBundleRecord<ResearchBundle> {
-    return this.#mutate((store) => store.saveResearchBundle(bundle, source, isSynthetic));
+  saveResearchBundle(bundle: ResearchBundle): StoredResearchBundleRecord<ResearchBundle> {
+    return this.#mutate((store) => store.saveResearchBundle(bundle));
   }
 
   getResearchBundle(
@@ -225,8 +208,8 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
     this.close();
   }
 
-  #newDomainStore(): InMemoryBizForgeDataStore {
-    return new InMemoryBizForgeDataStore({ dataStatus: sqliteStatus() });
+  #newDomainStore(): BizForgeStateStore {
+    return new BizForgeStateStore(sqliteStatus());
   }
 
   #migrate(): void {
@@ -289,7 +272,7 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
     return row;
   }
 
-  #loadDomainStore(): InMemoryBizForgeDataStore {
+  #loadDomainStore(): BizForgeStateStore {
     this.#assertOpen();
     const row = this.#loadStateRow();
     let snapshot: unknown;
@@ -315,7 +298,7 @@ export class SqliteBizForgeDataStore implements BizForgeDataStore {
   }
 
   #mutate<T>(
-    operation: (store: InMemoryBizForgeDataStore) => T,
+    operation: (store: BizForgeStateStore) => T,
     toleratePostCommitMaintenanceFailure = false,
     finalizePendingHistory = true,
   ): T {

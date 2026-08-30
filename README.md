@@ -71,8 +71,8 @@ npm run check
 ```
 
 `npm run check` runs formatting verification, linting, TypeScript checks, unit tests and the
-production build. Tests use isolated temporary databases or prepared records and do not require
-API keys.
+production build. Tests use isolated per-run databases or prepared records and do not require API
+keys.
 
 ### Local MCP server
 

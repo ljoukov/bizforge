@@ -2,24 +2,15 @@ import { z } from "zod";
 
 import { EntityIdSchema, IsoDateTimeSchema, NonEmptyStringSchema } from "../domain/common.js";
 
-export const DataSourceSchema = z.enum(["mock_seed", "mcp_write"]);
+export const DataSourceSchema = z.literal("mcp_write");
 export type DataSource = z.infer<typeof DataSourceSchema>;
 
 export const DataStoreStatusSchema = z
   .object({
-    dataMode: z.enum(["mock", "persistent"]),
-    storageMode: z.enum(["mock", "persistent"]),
+    dataMode: z.literal("persistent"),
+    storageMode: z.literal("persistent"),
     storageBackend: NonEmptyStringSchema,
-    persistenceStatus: z.enum(["mock_ephemeral", "persistent"]),
-    isMock: z.boolean(),
-    ephemeral: z.boolean(),
-    writePolicy: z
-      .object({
-        requiresExplicitMockAcceptance: z.boolean(),
-        acceptsNonSyntheticWrites: z.boolean(),
-      })
-      .strict(),
-    fixtureVersion: NonEmptyStringSchema,
+    persistenceStatus: z.literal("persistent"),
     warnings: z.array(NonEmptyStringSchema),
   })
   .strict();
@@ -127,7 +118,6 @@ export const DeletionRecordSchema = z
 export type DeletionRecord = z.infer<typeof DeletionRecordSchema>;
 
 export interface RecordOrigin extends DataStoreStatus {
-  readonly isSynthetic: boolean;
   readonly source: DataSource;
 }
 

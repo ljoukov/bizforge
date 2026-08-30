@@ -1,8 +1,19 @@
 import type { EvidenceItem } from "../../src/domain/evidence.js";
 import type { ConfirmedFounderProfileSnapshot } from "../../src/domain/founder-profile.js";
 import { type ResearchBundle, ResearchBundleSchema } from "../../src/domain/research-bundle.js";
-import { type BizForgeDataStore, InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
+import type { DataStoreStatus } from "../../src/mcp/contracts.js";
+import { type BizForgeDataStore, BizForgeStateStore } from "../../src/mcp/data-store.js";
 import { canonicalContentSha256 } from "../../src/mcp/integrity.js";
+
+function testDataStatus(): DataStoreStatus {
+  return {
+    dataMode: "persistent",
+    storageMode: "persistent",
+    storageBackend: "sqlite",
+    persistenceStatus: "persistent",
+    warnings: [],
+  };
+}
 
 const confidence = {
   lower: 0.55,
@@ -315,8 +326,6 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
   store.createSetupRun({
     setupRunId,
     founderId,
-    source: "mock_seed",
-    isSynthetic: true,
     now: capturedAt,
   });
   for (const [consentId, scope] of [
@@ -325,19 +334,16 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
     ["consent-retain-synthetic-demo", "retain_minimized_founder_snapshot"],
     ["consent-research-synthetic-demo", "use_confirmed_founder_snapshot_for_research"],
   ] as const) {
-    store.recordConsent(
-      {
-        consentId,
-        setupRunId,
-        founderId,
-        scope,
-        status: "active",
-        sourceUrls: [],
-        recordedAt: capturedAt,
-        grantedAt: capturedAt,
-      },
-      "mock_seed",
-    );
+    store.recordConsent({
+      consentId,
+      setupRunId,
+      founderId,
+      scope,
+      status: "active",
+      sourceUrls: [],
+      recordedAt: capturedAt,
+      grantedAt: capturedAt,
+    });
   }
   const evidence: EvidenceItem = {
     evidenceId,
@@ -358,7 +364,7 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
     attributes: { synthetic: true },
     tags: ["synthetic", "founder-self-report"],
   };
-  store.putEvidence(setupRunId, evidence, "mock_seed", true);
+  store.putEvidence(setupRunId, evidence);
   store.transitionSetupRun({
     setupRunId,
     expectedVersion: 1,
@@ -375,8 +381,6 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
     setupRunId,
     expectedVersion: 3,
     idempotencyKey: "seed-confirm",
-    isSynthetic: true,
-    source: "mock_seed",
     profile: {
       snapshotId: "snapshot-synthetic-demo",
       founderId,
@@ -414,15 +418,11 @@ export function seedSyntheticMockData(store: BizForgeDataStore): void {
       confirmedAt,
     },
   });
-  store.saveResearchBundle(
-    buildSyntheticResearchBundle(confirmed.profile.value, [evidence]),
-    "mock_seed",
-    true,
-  );
+  store.saveResearchBundle(buildSyntheticResearchBundle(confirmed.profile.value, [evidence]));
 }
 
-export function createSeededBizForgeDataStore(): InMemoryBizForgeDataStore {
-  const store = new InMemoryBizForgeDataStore();
+export function createSeededBizForgeDataStore(): BizForgeStateStore {
+  const store = new BizForgeStateStore(testDataStatus());
   seedSyntheticMockData(store);
   return store;
 }

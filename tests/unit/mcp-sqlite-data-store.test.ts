@@ -127,13 +127,12 @@ function prepareConfirmedFounder(store: SqliteBizForgeDataStore, suffix: string)
     founderId,
     setupRunId,
     clientRequestId: `create-${suffix}`,
-    isSynthetic: false,
     now: timestamp,
   } as const;
   store.createSetupRun(createInput);
   recordRequiredConsents(store, setupRunId, founderId);
   const evidence = founderEvidence(evidenceId);
-  store.putEvidence(setupRunId, evidence, "mcp_write", false);
+  store.putEvidence(setupRunId, evidence);
   const interviewInput = {
     setupRunId,
     expectedVersion: 1,
@@ -153,8 +152,6 @@ function prepareConfirmedFounder(store: SqliteBizForgeDataStore, suffix: string)
     expectedVersion: 3,
     idempotencyKey: `confirm-${suffix}`,
     profile: requestedProfile,
-    isSynthetic: false,
-    source: "mcp_write" as const,
   };
   const confirmation = store.confirmFounderProfile(confirmationInput);
   return {
@@ -203,13 +200,6 @@ describe("SqliteBizForgeDataStore", () => {
       storageMode: "persistent",
       storageBackend: "sqlite",
       persistenceStatus: "persistent",
-      isMock: false,
-      ephemeral: false,
-      writePolicy: {
-        requiresExplicitMockAcceptance: false,
-        acceptsNonSyntheticWrites: true,
-      },
-      fixtureVersion: "not-applicable",
       warnings: [],
     });
     expect(store.getLatestResearchBundle()).toBeUndefined();
@@ -225,7 +215,7 @@ describe("SqliteBizForgeDataStore", () => {
     const first = openStore(path);
     const prepared = prepareConfirmedFounder(first, "restart");
     const bundle = researchBundle(prepared.profile, prepared.evidence);
-    const savedBundle = first.saveResearchBundle(bundle, "mcp_write", false);
+    const savedBundle = first.saveResearchBundle(bundle);
     const runBeforeRestart = first.getSetupRun(prepared.setupRunId);
     const profileBeforeRestart = first.getFounderProfile(prepared.profile.snapshotId);
 
@@ -233,16 +223,15 @@ describe("SqliteBizForgeDataStore", () => {
       stage2HandoffEligible: true,
       replayed: false,
       profile: {
-        isMock: false,
-        isSynthetic: false,
         storageBackend: "sqlite",
         persistenceStatus: "persistent",
+        source: "mcp_write",
       },
     });
     expect(savedBundle).toMatchObject({
-      isMock: false,
-      isSynthetic: false,
       storageBackend: "sqlite",
+      persistenceStatus: "persistent",
+      source: "mcp_write",
     });
 
     closeStore(first);
@@ -283,7 +272,6 @@ describe("SqliteBizForgeDataStore", () => {
       founderId: "founder-concurrent",
       setupRunId: "setup-concurrent",
       clientRequestId: "create-concurrent",
-      isSynthetic: false,
       now: timestamp,
     } as const;
     const created = first.createSetupRun(createInput);
@@ -318,7 +306,7 @@ describe("SqliteBizForgeDataStore", () => {
     const first = openStore(path);
     const setupRunId = "setup-revocation";
     const founderId = "founder-revocation";
-    first.createSetupRun({ setupRunId, founderId, isSynthetic: false, now: timestamp });
+    first.createSetupRun({ setupRunId, founderId, now: timestamp });
     first.recordConsent({
       consentId: "consent-active-revocation",
       setupRunId,
@@ -330,7 +318,7 @@ describe("SqliteBizForgeDataStore", () => {
       grantedAt: "2026-08-29T12:00:00.000Z",
     });
     const retainedEvidence = founderEvidence("evidence-before-revocation");
-    first.putEvidence(setupRunId, retainedEvidence, "mcp_write", false);
+    first.putEvidence(setupRunId, retainedEvidence);
     first.recordConsent({
       consentId: "consent-revoked-revocation",
       setupRunId,
@@ -349,12 +337,7 @@ describe("SqliteBizForgeDataStore", () => {
     ).toBe("revoked");
     expect(restarted.getEvidence(retainedEvidence.evidenceId)?.value).toEqual(retainedEvidence);
     expect(() =>
-      restarted.putEvidence(
-        setupRunId,
-        founderEvidence("evidence-after-revocation"),
-        "mcp_write",
-        false,
-      ),
+      restarted.putEvidence(setupRunId, founderEvidence("evidence-after-revocation")),
     ).toThrow(/Active retain_minimized_founder_self_report consent is required/);
   });
 
@@ -366,7 +349,7 @@ describe("SqliteBizForgeDataStore", () => {
     const evidenceId = "evidence-history-cleanup";
     const profileMarker = "SUPERSEDED-SQLITE-PROFILE-MARKER-71";
     const stateMarker = "SUPERSEDED-SQLITE-STATE-MARKER-84";
-    first.createSetupRun({ setupRunId, founderId, isSynthetic: false, now: timestamp });
+    first.createSetupRun({ setupRunId, founderId, now: timestamp });
     recordRequiredConsents(first, setupRunId, founderId);
     first.recordConsent({
       consentId: "history-active-sqlite",
@@ -379,7 +362,7 @@ describe("SqliteBizForgeDataStore", () => {
       grantedAt: "2026-08-29T11:00:00.000Z",
     });
     const evidence = founderEvidence(evidenceId);
-    first.putEvidence(setupRunId, evidence, "mcp_write", false);
+    first.putEvidence(setupRunId, evidence);
     first.transitionSetupRun({
       setupRunId,
       expectedVersion: 1,
@@ -401,7 +384,6 @@ describe("SqliteBizForgeDataStore", () => {
       expectedVersion: 3,
       idempotencyKey: "history-confirm-old",
       profile: requestedOldProfile,
-      isSynthetic: false,
     }).profile.value;
     first.transitionSetupRun({
       setupRunId,
@@ -420,7 +402,6 @@ describe("SqliteBizForgeDataStore", () => {
       expectedVersion: 5,
       idempotencyKey: "history-confirm-current",
       profile: requestedCurrentProfile,
-      isSynthetic: false,
     }).profile.value;
     expect(first.getFounderProfile(oldProfile.snapshotId)?.value).toEqual(oldProfile);
     const second = openStore(path);
@@ -573,15 +554,13 @@ describe("SqliteBizForgeDataStore", () => {
       expectedVersion: 5,
       idempotencyKey: "snapshot-withdrawal-confirmation",
       profile: requestedWithdrawnProfile,
-      isSynthetic: false,
-      source: "mcp_write" as const,
     };
     const withdrawnConfirmation = first.confirmFounderProfile(withdrawnConfirmationInput);
     const withdrawnProfile = withdrawnConfirmation.profile.value;
     expect(withdrawnProfile.snapshotId).toMatch(/^snapshot-/);
     expect(withdrawnProfile.snapshotId).not.toBe(requestedSnapshotIdMarker);
     const bundle = researchBundle(withdrawnProfile, prepared.evidence);
-    const savedBundle = first.saveResearchBundle(bundle, "mcp_write", false);
+    const savedBundle = first.saveResearchBundle(bundle);
     const opportunityId = bundle.opportunities[0]?.opportunityId;
     if (opportunityId === undefined) throw new Error("expected a research opportunity");
     const second = openStore(path);
@@ -688,6 +667,35 @@ describe("SqliteBizForgeDataStore", () => {
         version: 7,
         stateData: {},
       });
+      const blockedDraftMarker = "REVOKED-SNAPSHOT-DRAFT-BYPASS-MARKER-52";
+      expect(() =>
+        restarted.transitionSetupRun({
+          setupRunId: prepared.setupRunId,
+          expectedVersion: withdrawnRun?.value.version ?? 7,
+          targetState: "REVISION_DRAFT",
+          idempotencyKey: "snapshot-withdrawal-blocked-draft",
+          stateData: {
+            restoredDraft: {
+              founderProfileCopy: requestedWithdrawnProfile,
+              marker: blockedDraftMarker,
+            },
+          },
+        }),
+      ).toThrowError(
+        expect.objectContaining<Partial<BizForgeStoreError>>({ code: "consent_required" }),
+      );
+      expect(restarted.getSetupRun(prepared.setupRunId)).toEqual(withdrawnRun);
+      const afterRejectedDraft = new DatabaseSync(path, { timeout: 0 });
+      try {
+        const latest = afterRejectedDraft
+          .prepare("SELECT state_json FROM bizforge_state WHERE singleton_id = 1")
+          .get() as { state_json: string };
+        expect(latest.state_json).not.toContain(blockedDraftMarker);
+        expect(latest.state_json).not.toContain(requestedSnapshotIdMarker);
+        expect(latest.state_json).not.toContain("snapshot-withdrawal-blocked-draft");
+      } finally {
+        afterRejectedDraft.close();
+      }
       expect(() => restarted.confirmFounderProfile(withdrawnConfirmationInput)).toThrow(
         /snapshot was withdrawn/,
       );
@@ -716,8 +724,6 @@ describe("SqliteBizForgeDataStore", () => {
         expectedVersion: withdrawnRun?.value.version ?? 7,
         idempotencyKey: "snapshot-withdrawal-replacement",
         profile: requestedReplacementProfile,
-        isSynthetic: false,
-        source: "mcp_write",
       });
       const replacementProfile = replacementConfirmation.profile.value;
       expect(replacementConfirmation).toMatchObject({
@@ -781,7 +787,6 @@ describe("SqliteBizForgeDataStore", () => {
       setupRunId,
       founderId,
       clientRequestId: "create-delete",
-      isSynthetic: false,
       now: timestamp,
     } as const;
     first.createSetupRun(createInput);
@@ -796,7 +801,7 @@ describe("SqliteBizForgeDataStore", () => {
       grantedAt: timestamp,
     });
     const evidence = founderEvidence("evidence-delete", sensitiveMarker);
-    first.putEvidence(setupRunId, evidence, "mcp_write", false);
+    first.putEvidence(setupRunId, evidence);
     const deletionInput = {
       setupRunId,
       founderId,
@@ -806,9 +811,9 @@ describe("SqliteBizForgeDataStore", () => {
     const deleted = first.requestDeletion(deletionInput);
 
     expect(deleted).toMatchObject({
-      isMock: false,
-      isSynthetic: false,
       storageBackend: "sqlite",
+      persistenceStatus: "persistent",
+      source: "mcp_write",
       value: {
         setupRunId,
         status: "pending_expiry",
@@ -838,7 +843,6 @@ describe("SqliteBizForgeDataStore", () => {
         setupRunId,
         founderId,
         clientRequestId: "fresh-key-must-not-resurrect",
-        isSynthetic: false,
       }),
     ).toThrowError(
       expect.objectContaining<Partial<BizForgeStoreError>>({ code: "setup_run_deleted" }),
@@ -858,7 +862,7 @@ describe("SqliteBizForgeDataStore", () => {
     const sensitiveMarker = "PINNED-READER-FOUNDER-MARKER-93";
     const setupRunId = "setup-pinned-reader";
     const founderId = "founder-pinned-reader";
-    first.createSetupRun({ setupRunId, founderId, isSynthetic: false, now: timestamp });
+    first.createSetupRun({ setupRunId, founderId, now: timestamp });
     first.recordConsent({
       consentId: "consent-pinned-reader",
       setupRunId,
@@ -870,7 +874,7 @@ describe("SqliteBizForgeDataStore", () => {
       grantedAt: timestamp,
     });
     const evidence = founderEvidence("evidence-pinned-reader", sensitiveMarker);
-    first.putEvidence(setupRunId, evidence, "mcp_write", false);
+    first.putEvidence(setupRunId, evidence);
     const second = openStore(path);
 
     let reader: DatabaseSync | undefined = new DatabaseSync(path, { timeout: 0 });
@@ -945,7 +949,7 @@ describe("SqliteBizForgeDataStore", () => {
     const first = openStore(path);
     const setupRunId = "setup-invalid-mutation";
     const founderId = "founder-invalid-mutation";
-    first.createSetupRun({ setupRunId, founderId, isSynthetic: false, now: timestamp });
+    first.createSetupRun({ setupRunId, founderId, now: timestamp });
     first.recordConsent({
       consentId: "consent-invalid-mutation",
       setupRunId,
@@ -957,13 +961,13 @@ describe("SqliteBizForgeDataStore", () => {
       grantedAt: timestamp,
     });
     const validEvidence = founderEvidence("evidence-before-invalid-mutation");
-    first.putEvidence(setupRunId, validEvidence, "mcp_write", false);
+    first.putEvidence(setupRunId, validEvidence);
     const malformedEvidence = {
       ...founderEvidence("evidence-invalid-mutation"),
       summary: 42,
     } as unknown as EvidenceItem;
 
-    expect(() => first.putEvidence(setupRunId, malformedEvidence, "mcp_write", false)).toThrow();
+    expect(() => first.putEvidence(setupRunId, malformedEvidence)).toThrow();
     expect(first.getEvidence(malformedEvidence.evidenceId)).toBeUndefined();
     expect(first.getEvidence(validEvidence.evidenceId)?.value).toEqual(validEvidence);
 
@@ -982,7 +986,6 @@ describe("SqliteBizForgeDataStore", () => {
     store.createSetupRun({
       founderId: "founder-integrity",
       setupRunId: "setup-integrity",
-      isSynthetic: false,
       now: timestamp,
     });
     closeStore(store);

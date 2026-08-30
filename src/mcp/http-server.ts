@@ -109,10 +109,12 @@ async function serveRequest(
   if (!validateHost(request, response) || !validateOrigin(request, response)) return;
   const path = new URL(request.url ?? "/", "http://localhost").pathname;
   if (request.method === "GET" && path === "/healthz") {
+    const status = store.getDataStatus();
     const body = JSON.stringify({
       ok: true,
       service: "bizforge-mcp",
-      ...store.getDataStatus(),
+      persistenceReady: status.persistenceStatus === "persistent",
+      storageBackend: status.storageBackend,
     });
     response.writeHead(200, { "content-type": "application/json" });
     response.end(body);

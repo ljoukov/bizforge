@@ -4,8 +4,9 @@ import { dirname, resolve } from "node:path";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 
 import type { BizForgeDataStore } from "./data-store.js";
+import { canonicalContentSha256 } from "./integrity.js";
 import { SqliteBizForgeDataStore } from "./sqlite-data-store.js";
-import { createResponseEnvelope, registerBizForgeTools } from "./tools.js";
+import { registerBizForgeTools } from "./tools.js";
 
 const DEFAULT_DATABASE_PATH = ".data/bizforge.sqlite";
 
@@ -21,21 +22,17 @@ function requiredVariable(value: string | string[] | undefined, name: string): s
   return value;
 }
 
-function resourceContents(
-  store: BizForgeDataStore,
-  uri: URL,
-  payload: unknown,
-  isSynthetic: boolean,
-  source: "mock_seed" | "mcp_write",
-) {
+function resourceContents(uri: URL, payload: unknown) {
   return {
     contents: [
       {
         uri: uri.href,
         mimeType: "application/json",
-        text: JSON.stringify(
-          createResponseEnvelope(payload, store.getDataStatus(), { isSynthetic, source }),
-        ),
+        text: JSON.stringify({
+          schemaVersion: "1.0.0",
+          contentSha256: canonicalContentSha256(payload),
+          payload,
+        }),
       },
     ],
   };
@@ -61,13 +58,7 @@ export function createBizForgeMcpServer(store: BizForgeDataStore): McpServer {
       const evidenceId = requiredVariable(variables.evidenceId, "evidenceId");
       const record = store.getEvidence(evidenceId);
       if (record === undefined) throw new Error(`Evidence ${evidenceId} was not found`);
-      return resourceContents(
-        store,
-        uri,
-        { evidence: record.value },
-        record.isSynthetic,
-        record.source,
-      );
+      return resourceContents(uri, { evidence: record.value });
     },
   );
 
@@ -83,13 +74,7 @@ export function createBizForgeMcpServer(store: BizForgeDataStore): McpServer {
       const snapshotId = requiredVariable(variables.snapshotId, "snapshotId");
       const record = store.getFounderProfile(snapshotId);
       if (record === undefined) throw new Error(`Founder snapshot ${snapshotId} was not found`);
-      return resourceContents(
-        store,
-        uri,
-        { profile: record.value },
-        record.isSynthetic,
-        record.source,
-      );
+      return resourceContents(uri, { profile: record.value });
     },
   );
 
@@ -113,13 +98,7 @@ export function createBizForgeMcpServer(store: BizForgeDataStore): McpServer {
       const record = store.getResearchBundle(bundleId, version);
       if (record === undefined)
         throw new Error(`Research bundle ${bundleId}:${version} was not found`);
-      return resourceContents(
-        store,
-        uri,
-        { bundle: record.value },
-        record.isSynthetic,
-        record.source,
-      );
+      return resourceContents(uri, { bundle: record.value });
     },
   );
 
@@ -137,28 +116,19 @@ export function createBizForgeMcpServer(store: BizForgeDataStore): McpServer {
       if (result === undefined) {
         throw new Error(`Opportunity ${opportunityId} was not found`);
       }
-      return resourceContents(
-        store,
-        uri,
-        {
-          opportunity: result.opportunity,
-          buyerEvidenceStatus: "unlinked/hypothesis_only",
-          buyerEvidenceWarning:
-            "The current schema does not link economicBuyer text to buyer-specific claims.",
-        },
-        result.bundle.isSynthetic,
-        result.bundle.source,
-      );
+      return resourceContents(uri, {
+        opportunity: result.opportunity,
+        buyerEvidenceStatus: "unlinked/hypothesis_only",
+        buyerEvidenceWarning:
+          "The current schema does not link economicBuyer text to buyer-specific claims.",
+      });
     },
   );
 
   return server;
 }
 
-/**
- * Creates the persistent runtime store only when called. Live MCP processes
- * always use SQLite; in-memory fixtures are restricted to tests.
- */
+/** Creates the SQLite-backed runtime store when called. */
 export function createConfiguredBizForgeDataStore(
   configuration: BizForgeDataStoreConfiguration = {},
 ): BizForgeDataStore {

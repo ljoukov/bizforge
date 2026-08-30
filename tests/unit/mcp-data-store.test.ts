@@ -7,12 +7,8 @@ import {
   ConsentRecordSchema,
   type DataStoreStatus,
 } from "../../src/mcp/contracts.js";
-import { BizForgeStoreError, InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
+import { BizForgeStateStore, BizForgeStoreError } from "../../src/mcp/data-store.js";
 import { buildSyntheticResearchBundle, seedSyntheticMockData } from "../fixtures/mock-data.js";
-
-function makeStore() {
-  return new InMemoryBizForgeDataStore();
-}
 
 function persistentDataStatus(): DataStoreStatus {
   return {
@@ -20,19 +16,12 @@ function persistentDataStatus(): DataStoreStatus {
     storageMode: "persistent",
     storageBackend: "sqlite",
     persistenceStatus: "persistent",
-    isMock: false,
-    ephemeral: false,
-    writePolicy: {
-      requiresExplicitMockAcceptance: false,
-      acceptsNonSyntheticWrites: true,
-    },
-    fixtureVersion: "not-applicable",
     warnings: [],
   };
 }
 
-function makePersistentStore() {
-  return new InMemoryBizForgeDataStore({ dataStatus: persistentDataStatus() });
+function makeStore() {
+  return new BizForgeStateStore(persistentDataStatus());
 }
 
 function seedEvidence(evidenceId: string, timestamp = "2026-08-01T12:00:00.000Z"): EvidenceItem {
@@ -95,11 +84,10 @@ function seedProfile(
 }
 
 function prepareConfirmation(
-  store: InMemoryBizForgeDataStore,
+  store: BizForgeStateStore,
   ids = { setupRunId: "setup-new", founderId: "founder-new", evidenceId: "evidence-new" },
-  isSynthetic = true,
 ) {
-  store.createSetupRun({ ...ids, isSynthetic, now: "2026-08-01T12:00:00.000Z" });
+  store.createSetupRun({ ...ids, now: "2026-08-01T12:00:00.000Z" });
   for (const [consentId, scope] of [
     ["self-report-new", "retain_minimized_founder_self_report"],
     ["profile-evidence-new", "retain_minimized_profile_evidence"],
@@ -118,7 +106,7 @@ function prepareConfirmation(
     });
   }
   const evidence = seedEvidence(ids.evidenceId);
-  store.putEvidence(ids.setupRunId, evidence, "mcp_write", isSynthetic);
+  store.putEvidence(ids.setupRunId, evidence);
   store.transitionSetupRun({
     setupRunId: ids.setupRunId,
     expectedVersion: 1,
@@ -138,7 +126,115 @@ function prepareConfirmation(
   };
 }
 
-describe("InMemoryBizForgeDataStore", () => {
+describe("BizForgeStateStore", () => {
+  it("rejects any nonpersistent state-store status", () => {
+    const nonpersistentStatus = {
+      ...persistentDataStatus(),
+      dataMode: "mock",
+    } as unknown as DataStoreStatus;
+
+    expect(() => new BizForgeStateStore(nonpersistentStatus)).toThrow();
+  });
+
+  it("restores only valid legacy persistent snapshot markers and strips them", () => {
+    const store = makeStore();
+    store.createSetupRun({ setupRunId: "setup-legacy-origin", founderId: "founder-legacy-origin" });
+    const snapshot = store.exportSnapshot();
+    const legacyStatusMarkers = {
+      isMock: false,
+      ephemeral: false,
+      writePolicy: {
+        requiresExplicitMockAcceptance: false,
+        acceptsNonSyntheticWrites: true,
+      },
+      fixtureVersion: "not-applicable",
+    } as const;
+    const legacySnapshot = {
+      ...structuredClone(snapshot),
+      dataStatus: { ...snapshot.dataStatus, ...legacyStatusMarkers },
+      runs: snapshot.runs.map(
+        ([setupRunId, record]) =>
+          [setupRunId, { ...record, ...legacyStatusMarkers, isSynthetic: false }] as const,
+      ),
+    };
+
+    const restored = makeStore();
+    restored.restoreSnapshot(legacySnapshot);
+    expect(restored.exportSnapshot()).toEqual(snapshot);
+    expect(JSON.stringify(restored.exportSnapshot())).not.toContain("isSynthetic");
+
+    expect(() =>
+      makeStore().restoreSnapshot({
+        ...legacySnapshot,
+        runs: legacySnapshot.runs.map(([setupRunId, record]) => [
+          setupRunId,
+          { ...record, isSynthetic: true },
+        ]),
+      }),
+    ).toThrow();
+    expect(() =>
+      makeStore().restoreSnapshot({
+        ...legacySnapshot,
+        dataStatus: { ...legacySnapshot.dataStatus, isMock: true },
+      }),
+    ).toThrow();
+  });
+
+  it("rejects malformed migration envelopes and corrupted persistent snapshot identities", () => {
+    const setupRunId = "setup-snapshot-integrity";
+    const store = makeStore();
+    store.createSetupRun({ setupRunId, founderId: "founder-snapshot-integrity" });
+    const runOnlySnapshot = store.exportSnapshot();
+    const runEntry = runOnlySnapshot.runs[0];
+    if (runEntry === undefined) throw new Error("expected setup run fixture");
+
+    const expectInvalidSnapshot = (snapshot: unknown) => {
+      expect(() => makeStore().restoreSnapshot(snapshot)).toThrow();
+    };
+
+    // Exercise fail-closed preprocessing for malformed legacy-shaped values.
+    expectInvalidSnapshot(null);
+    expectInvalidSnapshot({ ...runOnlySnapshot, runs: [[setupRunId, null]] });
+    expectInvalidSnapshot({ ...runOnlySnapshot, runs: [null] });
+    expectInvalidSnapshot({ ...runOnlySnapshot, confirmationKeys: [null] });
+    expectInvalidSnapshot({ ...runOnlySnapshot, deletionKeys: [null] });
+
+    // Exercise current-schema identity and persistent-origin invariants.
+    expectInvalidSnapshot({ ...runOnlySnapshot, runs: [...runOnlySnapshot.runs, runEntry] });
+    expectInvalidSnapshot({
+      ...runOnlySnapshot,
+      runs: [["different-map-key", runEntry[1]]],
+    });
+    expectInvalidSnapshot({ ...runOnlySnapshot, deletedSetupRunIds: [setupRunId] });
+    expectInvalidSnapshot({
+      ...runOnlySnapshot,
+      runs: [[setupRunId, { ...runEntry[1], storageBackend: "different-store" }]],
+    });
+
+    store.transitionSetupRun({
+      setupRunId,
+      expectedVersion: 1,
+      targetState: "INTERVIEW",
+      idempotencyKey: "coverage-transition",
+    });
+    const transitionedSnapshot = store.exportSnapshot();
+    const transitionEntry = transitionedSnapshot.transitionKeys[0];
+    if (transitionEntry === undefined) throw new Error("expected transition receipt fixture");
+
+    expectInvalidSnapshot({
+      ...transitionedSnapshot,
+      transitionKeys: [["different-owner:coverage-transition", transitionEntry[1]]],
+    });
+    expectInvalidSnapshot({
+      ...transitionedSnapshot,
+      transitionKeys: [[`${setupRunId}:`, transitionEntry[1]]],
+    });
+    expectInvalidSnapshot({
+      ...transitionedSnapshot,
+      transitionKeys: [transitionEntry, [`${setupRunId}:coverage-transition`, transitionEntry[1]]],
+    });
+  });
+
   it("requires consent timestamps appropriate to active and revoked status", () => {
     const base = {
       consentId: "consent-validation",
@@ -160,7 +256,7 @@ describe("InMemoryBizForgeDataStore", () => {
     );
   });
 
-  it("seeds a schema-valid synthetic Step 1 to Step 2 to Step 3 demo", () => {
+  it("loads a schema-valid persistent Step 1 to Step 2 to Step 3 test fixture", () => {
     const store = makeStore();
     seedSyntheticMockData(store);
 
@@ -168,13 +264,14 @@ describe("InMemoryBizForgeDataStore", () => {
     const bundle = store.getLatestResearchBundle("founder-synthetic-demo");
     expect(run?.value.state).toBe("CONFIRMED");
     expect(run).toMatchObject({
-      isMock: true,
-      ephemeral: true,
-      storageBackend: "memory",
-      isSynthetic: true,
-      source: "mock_seed",
+      dataMode: "persistent",
+      storageMode: "persistent",
+      persistenceStatus: "persistent",
+      storageBackend: "sqlite",
+      source: "mcp_write",
     });
-    expect(bundle?.value.founderProfile.snapshotId).toBe("snapshot-synthetic-demo");
+    expect(bundle?.value.founderProfile.snapshotId).toMatch(/^snapshot-[0-9a-f-]{36}$/);
+    expect(bundle?.value.founderProfile.snapshotId).toBe(run?.value.stateData.confirmedSnapshotId);
     expect(bundle?.value.marketSignals[0]?.measurement).toMatchObject({
       baselineValue: 24,
       value: 39,
@@ -194,17 +291,15 @@ describe("InMemoryBizForgeDataStore", () => {
     const created = store.createSetupRun({
       founderId: "founder-cas",
       setupRunId: "setup-cas",
-      isSynthetic: true,
     });
     expect(
       store.createSetupRun({
         founderId: "founder-cas",
         setupRunId: "setup-cas",
-        isSynthetic: true,
       }),
     ).toEqual(created);
     expect(() =>
-      store.createSetupRun({ founderId: "other", setupRunId: "setup-cas", isSynthetic: true }),
+      store.createSetupRun({ founderId: "other", setupRunId: "setup-cas" }),
     ).toThrowError(BizForgeStoreError);
 
     const input = {
@@ -232,23 +327,16 @@ describe("InMemoryBizForgeDataStore", () => {
     ).toThrow(/reserved for atomic founder-profile confirmation/);
     expect(() => store.getConsent("unknown")).toThrow(/not found/);
 
-    store.createSetupRun({
-      founderId: "founder-synthetic-origin",
-      setupRunId: "setup-synthetic-origin",
-      isSynthetic: true,
+    expect(created).toMatchObject({
+      dataMode: "persistent",
+      storageMode: "persistent",
+      source: "mcp_write",
     });
-    expect(() =>
-      store.createSetupRun({
-        founderId: "founder-synthetic-origin",
-        setupRunId: "setup-synthetic-origin",
-        isSynthetic: false,
-      }),
-    ).toThrow(/synthetic records only/);
   });
 
   it("assigns opaque runtime IDs and replays an explicit setup ID without a founder ID", () => {
     const store = makeStore();
-    const generated = store.createSetupRun({ isSynthetic: true });
+    const generated = store.createSetupRun({});
 
     expect(generated.value.founderId).toMatch(/^founder-[0-9a-f-]+$/);
     expect(generated.value.setupRunId).toMatch(/^setup-[0-9a-f-]+$/);
@@ -256,18 +344,14 @@ describe("InMemoryBizForgeDataStore", () => {
     const explicit = store.createSetupRun({
       founderId: "founder-explicit",
       setupRunId: "setup-explicit",
-      isSynthetic: true,
     });
-    expect(store.createSetupRun({ setupRunId: "setup-explicit", isSynthetic: true })).toEqual(
-      explicit,
-    );
+    expect(store.createSetupRun({ setupRunId: "setup-explicit" })).toEqual(explicit);
   });
 
   it("replays generated setup IDs by client request and rejects conflicting key reuse", () => {
     const store = makeStore();
     const request = {
       clientRequestId: "application-generated-create-request",
-      isSynthetic: true,
     } as const;
     const created = store.createSetupRun(request);
 
@@ -279,7 +363,7 @@ describe("InMemoryBizForgeDataStore", () => {
 
   it("rejects blank request keys before any mutation can be persisted", () => {
     const store = makeStore();
-    expect(() => store.createSetupRun({ clientRequestId: " \t", isSynthetic: true })).toThrow(
+    expect(() => store.createSetupRun({ clientRequestId: " \t" })).toThrow(
       /clientRequestId must contain at least one non-whitespace character/,
     );
     expect(store.exportSnapshot().creationKeys).toHaveLength(0);
@@ -304,7 +388,6 @@ describe("InMemoryBizForgeDataStore", () => {
         expectedVersion: 3,
         idempotencyKey: "\n",
         profile: prepared.profile,
-        isSynthetic: true,
       }),
     ).toThrow(/idempotency key must contain at least one non-whitespace character/);
     expect(() =>
@@ -338,7 +421,7 @@ describe("InMemoryBizForgeDataStore", () => {
     );
 
     const creationStore = makeStore();
-    creationStore.createSetupRun({ clientRequestId: "valid-create", isSynthetic: true });
+    creationStore.createSetupRun({ clientRequestId: "valid-create" });
     const validCreationSnapshot = creationStore.exportSnapshot();
     const creationReceipt = validCreationSnapshot.creationKeys[0]?.[1];
     if (creationReceipt === undefined) throw new Error("expected creation receipt");
@@ -356,7 +439,6 @@ describe("InMemoryBizForgeDataStore", () => {
     store.createSetupRun({
       founderId: "founder-interview-checkpoint",
       setupRunId: "setup-interview-checkpoint",
-      isSynthetic: true,
     });
     const enteredInterview = store.transitionSetupRun({
       setupRunId: "setup-interview-checkpoint",
@@ -417,8 +499,8 @@ describe("InMemoryBizForgeDataStore", () => {
 
   it("isolates scoped idempotency keys for legacy explicit setup IDs containing colons", () => {
     const store = makeStore();
-    store.createSetupRun({ setupRunId: "a", founderId: "founder-a", isSynthetic: true });
-    store.createSetupRun({ setupRunId: "a:b", founderId: "founder-a-b", isSynthetic: true });
+    store.createSetupRun({ setupRunId: "a", founderId: "founder-a" });
+    store.createSetupRun({ setupRunId: "a:b", founderId: "founder-a-b" });
     const firstInput = {
       setupRunId: "a",
       expectedVersion: 1,
@@ -451,7 +533,6 @@ describe("InMemoryBizForgeDataStore", () => {
     legacyStore.createSetupRun({
       setupRunId: "legacy:run",
       founderId: "legacy-founder",
-      isSynthetic: true,
     });
     const legacyInput = {
       setupRunId: "legacy:run",
@@ -479,10 +560,9 @@ describe("InMemoryBizForgeDataStore", () => {
     store.createSetupRun({
       founderId: "founder-purpose",
       setupRunId: "setup-purpose",
-      isSynthetic: true,
     });
     const selfReport = seedEvidence("evidence-purpose");
-    expect(() => store.putEvidence("setup-purpose", selfReport, "mcp_write", true)).toThrow(
+    expect(() => store.putEvidence("setup-purpose", selfReport)).toThrow(
       /retain_minimized_founder_self_report/,
     );
     store.recordConsent({
@@ -504,39 +584,24 @@ describe("InMemoryBizForgeDataStore", () => {
         collectionMethod: "manual_import" as const,
       },
     };
-    expect(store.putEvidence("setup-purpose", profileEvidence, "mcp_write", true).value).toEqual(
-      profileEvidence,
-    );
+    expect(store.putEvidence("setup-purpose", profileEvidence).value).toEqual(profileEvidence);
     expect(() =>
-      store.putEvidence(
-        "setup-purpose",
-        {
-          ...selfReport,
-          evidenceId: "misclassified-user-input-purpose",
-          provenance: {
-            ...selfReport.provenance,
-            collectionMethod: "manual_import",
-          },
+      store.putEvidence("setup-purpose", {
+        ...selfReport,
+        evidenceId: "misclassified-user-input-purpose",
+        provenance: {
+          ...selfReport.provenance,
+          collectionMethod: "manual_import",
         },
-        "mcp_write",
-        true,
-      ),
+      }),
     ).toThrow(/user_input evidenceType and user_input collectionMethod/);
     expect(() =>
-      store.putEvidence(
-        "setup-purpose",
-        {
-          ...selfReport,
-          evidenceId: "misclassified-import-purpose",
-          evidenceType: "other",
-        },
-        "mcp_write",
-        true,
-      ),
+      store.putEvidence("setup-purpose", {
+        ...selfReport,
+        evidenceId: "misclassified-import-purpose",
+        evidenceType: "other",
+      }),
     ).toThrow(/user_input evidenceType and user_input collectionMethod/);
-    expect(() => store.putEvidence("setup-purpose", selfReport, "mcp_write", false)).toThrow(
-      /synthetic records only/,
-    );
     store.recordConsent({
       consentId: "profile-purpose-revoked",
       setupRunId: "setup-purpose",
@@ -548,19 +613,17 @@ describe("InMemoryBizForgeDataStore", () => {
       revokedAt: "2026-08-02T12:00:00.000Z",
     });
     expect(() =>
-      store.putEvidence(
-        "setup-purpose",
-        { ...profileEvidence, evidenceId: "profile-evidence-after-revoke" },
-        "mcp_write",
-        true,
-      ),
+      store.putEvidence("setup-purpose", {
+        ...profileEvidence,
+        evidenceId: "profile-evidence-after-revoke",
+      }),
     ).toThrow(/retain_minimized_profile_evidence/);
   });
 
   it("keeps consent and evidence immutable and scoped to a run", () => {
     const store = makeStore();
-    store.createSetupRun({ founderId: "founder-a", setupRunId: "setup-a", isSynthetic: true });
-    store.createSetupRun({ founderId: "founder-b", setupRunId: "setup-b", isSynthetic: true });
+    store.createSetupRun({ founderId: "founder-a", setupRunId: "setup-a" });
+    store.createSetupRun({ founderId: "founder-b", setupRunId: "setup-b" });
     const consent = {
       consentId: "consent-a",
       setupRunId: "setup-a",
@@ -571,7 +634,7 @@ describe("InMemoryBizForgeDataStore", () => {
       recordedAt: "2026-08-01T12:00:00.000Z",
       grantedAt: "2026-08-01T12:00:00.000Z",
     };
-    expect(store.recordConsent(consent).isSynthetic).toBe(true);
+    expect(store.recordConsent(consent).source).toBe("mcp_write");
     expect(store.recordConsent(consent).value).toEqual(consent);
     expect(store.getConsent("setup-a", consent.scope)).toHaveLength(1);
     expect(store.getConsent("setup-a", "retain_founder_version_history")).toHaveLength(0);
@@ -597,8 +660,8 @@ describe("InMemoryBizForgeDataStore", () => {
     }
 
     const evidence = seedEvidence("evidence-a");
-    expect(store.putEvidence("setup-a", evidence, "mcp_write", true).value).toEqual(evidence);
-    expect(store.putEvidence("setup-a", evidence, "mcp_write", true).value).toEqual(evidence);
+    expect(store.putEvidence("setup-a", evidence).value).toEqual(evidence);
+    expect(store.putEvidence("setup-a", evidence).value).toEqual(evidence);
     expect(store.getEvidence("evidence-a")?.value).toEqual(evidence);
     expect(store.getEvidence("missing")).toBeUndefined();
     expect(() => store.putEvidence("setup-b", evidence)).toThrow(/different content or ownership/);
@@ -607,19 +670,18 @@ describe("InMemoryBizForgeDataStore", () => {
     );
   });
 
-  it("publishes a synthetic profile without generating research and saves a bundle explicitly", () => {
+  it("publishes a profile without generating research and saves a bundle explicitly", () => {
     const store = makeStore();
     const prepared = prepareConfirmation(store);
     const input = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "confirm-new",
-      isSynthetic: true,
       profile: prepared.profile,
     };
     const result = store.confirmFounderProfile(input);
     expect(result).toMatchObject({
-      stage2HandoffEligible: false,
+      stage2HandoffEligible: true,
       replayed: false,
       run: { state: "CONFIRMED", version: 4 },
     });
@@ -630,21 +692,20 @@ describe("InMemoryBizForgeDataStore", () => {
         profile: { ...input.profile, displayName: "Changed" },
       }),
     ).toThrow(/idempotency key/);
-    expect(store.getFounderProfile(prepared.profile.snapshotId)?.value).toEqual(prepared.profile);
+    const confirmedProfile = result.profile.value;
+    expect(confirmedProfile.snapshotId).toMatch(/^snapshot-[0-9a-f-]{36}$/);
+    expect(store.getFounderProfile(confirmedProfile.snapshotId)?.value).toEqual(confirmedProfile);
     expect(store.getFounderProfile("missing")).toBeUndefined();
 
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
-    const bundle = buildSyntheticResearchBundle(prepared.profile, [prepared.evidence]);
-    const saved = store.saveResearchBundle(bundle, "mcp_write", true);
-    expect(saved.value.founderProfile).toEqual(prepared.profile);
+    const bundle = buildSyntheticResearchBundle(confirmedProfile, [prepared.evidence]);
+    const saved = store.saveResearchBundle(bundle);
+    expect(saved.value.founderProfile).toEqual(confirmedProfile);
     expect(saved.value.opportunities[0]?.founderProfileSnapshotId).toBe(
-      prepared.profile.snapshotId,
+      confirmedProfile.snapshotId,
     );
-    expect(saved.isSynthetic).toBe(true);
-    expect(store.saveResearchBundle(bundle, "mcp_write", true)).toEqual(saved);
-    expect(() => store.saveResearchBundle(bundle, "mcp_write", false)).toThrow(
-      /synthetic records only/,
-    );
+    expect(saved).toMatchObject({ source: "mcp_write" });
+    expect(store.saveResearchBundle(bundle)).toEqual(saved);
   });
 
   it("uses only the newest consent event and keeps research handoff disabled after revocation", () => {
@@ -669,7 +730,6 @@ describe("InMemoryBizForgeDataStore", () => {
         setupRunId: retention.setupRunId,
         expectedVersion: 3,
         idempotencyKey: "retention-revoked",
-        isSynthetic: true,
         profile: retention.profile,
       }),
     ).toThrow(/retain_minimized_founder_snapshot/);
@@ -695,7 +755,6 @@ describe("InMemoryBizForgeDataStore", () => {
       setupRunId: research.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "research-revoked",
-      isSynthetic: true,
       profile: research.profile,
     });
     expect(result).toMatchObject({
@@ -704,93 +763,66 @@ describe("InMemoryBizForgeDataStore", () => {
     });
     expect(() =>
       researchStore.saveResearchBundle(
-        buildSyntheticResearchBundle(research.profile, [research.evidence]),
-        "mcp_write",
-        true,
+        buildSyntheticResearchBundle(result.profile.value, [research.evidence]),
       ),
     ).toThrow(/use_confirmed_founder_snapshot_for_research/);
     expect(researchStore.getLatestResearchBundle(research.founderId)).toBeUndefined();
   });
 
   it("recomputes confirmation replay eligibility after research consent is revoked and restored", () => {
-    for (const scenario of [
-      {
-        name: "mock",
-        store: makeStore(),
-        restoredStore: makeStore(),
-        isSynthetic: true,
-        initialStage2Eligibility: false,
-      },
-      {
-        name: "persistent",
-        store: makePersistentStore(),
-        restoredStore: makePersistentStore(),
-        isSynthetic: false,
-        initialStage2Eligibility: true,
-      },
-    ]) {
-      const prepared = prepareConfirmation(
-        scenario.store,
-        {
-          setupRunId: `setup-replay-revocation-${scenario.name}`,
-          founderId: `founder-replay-revocation-${scenario.name}`,
-          evidenceId: `evidence-replay-revocation-${scenario.name}`,
-        },
-        scenario.isSynthetic,
-      );
-      const input = {
-        setupRunId: prepared.setupRunId,
-        expectedVersion: 3,
-        idempotencyKey: "confirmation-replay-revocation",
-        isSynthetic: scenario.isSynthetic,
-        profile: prepared.profile,
-      };
-      expect(scenario.store.confirmFounderProfile(input)).toMatchObject({
-        stage2HandoffEligible: scenario.initialStage2Eligibility,
-        replayed: false,
-      });
-      scenario.store.recordConsent({
-        consentId: `research-replay-revoked-${scenario.name}`,
-        setupRunId: prepared.setupRunId,
-        founderId: prepared.founderId,
-        scope: "use_confirmed_founder_snapshot_for_research",
-        status: "revoked",
-        sourceUrls: [],
-        recordedAt: "2026-08-30T12:00:00.000Z",
-        revokedAt: "2026-08-30T12:00:00.000Z",
-      });
-      const snapshotWithStaleCachedEligibility = scenario.store.exportSnapshot();
+    const store = makeStore();
+    const restoredStore = makeStore();
+    const prepared = prepareConfirmation(store, {
+      setupRunId: "setup-replay-revocation",
+      founderId: "founder-replay-revocation",
+      evidenceId: "evidence-replay-revocation",
+    });
+    const input = {
+      setupRunId: prepared.setupRunId,
+      expectedVersion: 3,
+      idempotencyKey: "confirmation-replay-revocation",
+      profile: prepared.profile,
+    };
+    expect(store.confirmFounderProfile(input)).toMatchObject({
+      stage2HandoffEligible: true,
+      replayed: false,
+    });
+    store.recordConsent({
+      consentId: "research-replay-revoked",
+      setupRunId: prepared.setupRunId,
+      founderId: prepared.founderId,
+      scope: "use_confirmed_founder_snapshot_for_research",
+      status: "revoked",
+      sourceUrls: [],
+      recordedAt: "2026-08-30T12:00:00.000Z",
+      revokedAt: "2026-08-30T12:00:00.000Z",
+    });
+    const snapshotWithStaleCachedEligibility = store.exportSnapshot();
 
-      expect(scenario.store.confirmFounderProfile(input)).toMatchObject({
-        stage2HandoffEligible: false,
-        replayed: true,
-      });
+    expect(store.confirmFounderProfile(input)).toMatchObject({
+      stage2HandoffEligible: false,
+      replayed: true,
+    });
 
-      scenario.restoredStore.restoreSnapshot(snapshotWithStaleCachedEligibility);
-      expect(scenario.restoredStore.confirmFounderProfile(input)).toMatchObject({
-        stage2HandoffEligible: false,
-        replayed: true,
-      });
-    }
+    restoredStore.restoreSnapshot(snapshotWithStaleCachedEligibility);
+    expect(restoredStore.confirmFounderProfile(input)).toMatchObject({
+      stage2HandoffEligible: false,
+      replayed: true,
+    });
   });
 
-  it("server-issues opaque snapshot IDs for real profiles and tombstones only issued IDs", () => {
-    const store = makePersistentStore();
-    const prepared = prepareConfirmation(
-      store,
-      {
-        setupRunId: "setup-server-issued-snapshot",
-        founderId: "founder-server-issued-snapshot",
-        evidenceId: "evidence-server-issued-snapshot",
-      },
-      false,
-    );
+  it("server-issues opaque snapshot IDs and tombstones only issued IDs", () => {
+    const store = makeStore();
+    const prepared = prepareConfirmation(store, {
+      setupRunId: "setup-server-issued-snapshot",
+      founderId: "founder-server-issued-snapshot",
+      evidenceId: "evidence-server-issued-snapshot",
+    });
     const requestedSnapshotId = "client-selected-semantic-profile-id";
     const input = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "server-issued-snapshot-confirmation",
-      isSynthetic: false,
       profile: { ...prepared.profile, snapshotId: requestedSnapshotId },
     } as const;
     const confirmed = store.confirmFounderProfile(input);
@@ -866,14 +898,12 @@ describe("InMemoryBizForgeDataStore", () => {
       setupRunId: prepared.setupRunId,
       expectedVersion: 4,
       idempotencyKey: "confirmation-snapshot-retention-revoked",
-      isSynthetic: true,
       profile: withdrawnProfile,
     } as const;
-    store.confirmFounderProfile(confirmationInput);
+    const withdrawalConfirmation = store.confirmFounderProfile(confirmationInput);
+    const retainedProfile = withdrawalConfirmation.profile.value;
     const bundle = store.saveResearchBundle(
-      buildSyntheticResearchBundle(withdrawnProfile, [prepared.evidence]),
-      "mcp_write",
-      true,
+      buildSyntheticResearchBundle(retainedProfile, [prepared.evidence]),
     );
     const opportunityId = bundle.value.opportunities[0]?.opportunityId;
     if (opportunityId === undefined) throw new Error("expected generated opportunity");
@@ -889,7 +919,7 @@ describe("InMemoryBizForgeDataStore", () => {
       recordedAt: "2026-07-30T12:00:00.000Z",
       revokedAt: "2026-07-30T12:00:00.000Z",
     });
-    expect(store.getFounderProfile(withdrawnProfile.snapshotId)?.value).toEqual(withdrawnProfile);
+    expect(store.getFounderProfile(retainedProfile.snapshotId)?.value).toEqual(retainedProfile);
     expect(store.exportSnapshot().historyCleanupGeneration).toBe(
       beforeBackdatedRevocation.historyCleanupGeneration,
     );
@@ -906,20 +936,22 @@ describe("InMemoryBizForgeDataStore", () => {
     };
     store.recordConsent(revocation);
 
-    expect(store.getFounderProfile(withdrawnProfile.snapshotId)).toBeUndefined();
+    expect(store.getFounderProfile(retainedProfile.snapshotId)).toBeUndefined();
     expect(
       store.getResearchBundle(bundle.value.bundleId, bundle.value.bundleVersion),
     ).toBeUndefined();
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
     expect(store.getOpportunity(opportunityId)).toBeUndefined();
-    expect(() => store.confirmFounderProfile(confirmationInput)).toThrow(
-      /snapshot ID was withdrawn/,
-    );
+    expect(() => store.confirmFounderProfile(confirmationInput)).toThrow(/snapshot was withdrawn/);
     expect(() =>
       store.confirmFounderProfile({
         ...confirmationInput,
         idempotencyKey: "attempt-withdrawn-snapshot-resurrection",
-        profile: { ...withdrawnProfile, displayName: "Changed withdrawn payload" },
+        profile: {
+          ...withdrawnProfile,
+          snapshotId: retainedProfile.snapshotId,
+          displayName: "Changed withdrawn payload",
+        },
       }),
     ).toThrow(/snapshot ID was withdrawn/);
 
@@ -929,7 +961,7 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(withdrawnSnapshot.profiles).toHaveLength(0);
     expect(withdrawnSnapshot.bundles).toHaveLength(0);
     expect(withdrawnSnapshot.currentProfileSnapshotIds).toHaveLength(0);
-    expect(withdrawnSnapshot.withdrawnProfileSnapshotIds).toContain(withdrawnProfile.snapshotId);
+    expect(withdrawnSnapshot.withdrawnProfileSnapshotIds).toContain(retainedProfile.snapshotId);
     expect(withdrawnSnapshot.profileReplacementRequiredSetupRunIds).toContain(prepared.setupRunId);
     expect(withdrawnSnapshot.historyCleanupGeneration).toBeGreaterThan(
       withdrawnSnapshot.historyCleanupCompletedGeneration,
@@ -986,13 +1018,13 @@ describe("InMemoryBizForgeDataStore", () => {
 
     const restored = makeStore();
     restored.restoreSnapshot(withdrawnSnapshot);
-    expect(restored.getFounderProfile(withdrawnProfile.snapshotId)).toBeUndefined();
+    expect(restored.getFounderProfile(retainedProfile.snapshotId)).toBeUndefined();
     expect(
       restored.getResearchBundle(bundle.value.bundleId, bundle.value.bundleVersion),
     ).toBeUndefined();
     expect(restored.getOpportunity(opportunityId)).toBeUndefined();
     expect(() => restored.confirmFounderProfile(confirmationInput)).toThrow(
-      /snapshot ID was withdrawn/,
+      /snapshot was withdrawn/,
     );
     expect(restored.getEvidence(prepared.evidenceId)?.value).toEqual(prepared.evidence);
 
@@ -1096,26 +1128,30 @@ describe("InMemoryBizForgeDataStore", () => {
       displayName: "Replacement Founder Profile",
       confirmedAt: "2026-08-31T12:00:00.000Z",
     };
-    expect(
-      restored.confirmFounderProfile({
-        setupRunId: prepared.setupRunId,
-        expectedVersion: 6,
-        idempotencyKey: "confirmation-after-retention-reconsent",
-        isSynthetic: true,
-        profile: replacementProfile,
-      }),
-    ).toMatchObject({
+    const replacementConfirmation = restored.confirmFounderProfile({
+      setupRunId: prepared.setupRunId,
+      expectedVersion: 6,
+      idempotencyKey: "confirmation-after-retention-reconsent",
+      profile: replacementProfile,
+    });
+    expect(replacementConfirmation).toMatchObject({
       replayed: false,
       run: { state: "CONFIRMED", version: 7 },
-      profile: { value: replacementProfile },
+      profile: {
+        value: {
+          founderId: replacementProfile.founderId,
+          displayName: replacementProfile.displayName,
+        },
+      },
     });
+    const retainedReplacementProfile = replacementConfirmation.profile.value;
     const replacedSnapshot = restored.exportSnapshot();
-    expect(replacedSnapshot.withdrawnProfileSnapshotIds).toContain(withdrawnProfile.snapshotId);
+    expect(replacedSnapshot.withdrawnProfileSnapshotIds).toContain(retainedProfile.snapshotId);
     expect(replacedSnapshot.profileReplacementRequiredSetupRunIds).not.toContain(
       prepared.setupRunId,
     );
-    expect(restored.getFounderProfile(replacementProfile.snapshotId)?.value).toEqual(
-      replacementProfile,
+    expect(restored.getFounderProfile(retainedReplacementProfile.snapshotId)?.value).toEqual(
+      retainedReplacementProfile,
     );
     const restoredHistoricalReplayAfterReplacement = {
       ...structuredClone(replacedSnapshot),
@@ -1129,7 +1165,7 @@ describe("InMemoryBizForgeDataStore", () => {
       /transition replay is at or before founder-snapshot withdrawal/,
     );
     const nonCanonicalConfirmedStateData = {
-      confirmedSnapshotId: replacementProfile.snapshotId,
+      confirmedSnapshotId: retainedReplacementProfile.snapshotId,
       nestedProfile: withdrawnProfile,
     };
     const restoredConfirmedStateData = {
@@ -1218,12 +1254,12 @@ describe("InMemoryBizForgeDataStore", () => {
       /confirmation idempotency key references missing confirmed state/,
     );
     expect(() => restored.confirmFounderProfile(confirmationInput)).toThrow(
-      /snapshot ID was withdrawn/,
+      /snapshot was withdrawn/,
     );
     const restarted = makeStore();
     restarted.restoreSnapshot(replacedSnapshot);
-    expect(restarted.getFounderProfile(replacementProfile.snapshotId)?.value).toEqual(
-      replacementProfile,
+    expect(restarted.getFounderProfile(retainedReplacementProfile.snapshotId)?.value).toEqual(
+      retainedReplacementProfile,
     );
   });
 
@@ -1243,7 +1279,6 @@ describe("InMemoryBizForgeDataStore", () => {
       expectedVersion: 3,
       idempotencyKey: "confirm-before-deletion-state-withdrawal",
       profile,
-      isSynthetic: true,
     });
     store.transitionSetupRun({
       setupRunId: prepared.setupRunId,
@@ -1302,14 +1337,11 @@ describe("InMemoryBizForgeDataStore", () => {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "confirm-history-old",
-      isSynthetic: true,
       profile: oldProfile,
     } as const;
-    store.confirmFounderProfile(oldConfirmation);
+    const oldConfirmedProfile = store.confirmFounderProfile(oldConfirmation).profile.value;
     store.saveResearchBundle(
-      buildSyntheticResearchBundle(oldProfile, [prepared.evidence]),
-      "mcp_write",
-      true,
+      buildSyntheticResearchBundle(oldConfirmedProfile, [prepared.evidence]),
     );
     const revisionTransition = {
       setupRunId: prepared.setupRunId,
@@ -1320,7 +1352,7 @@ describe("InMemoryBizForgeDataStore", () => {
     };
     store.transitionSetupRun(revisionTransition);
     const currentEvidence = seedEvidence("evidence-history-current", "2026-08-30T12:00:00.000Z");
-    store.putEvidence(prepared.setupRunId, currentEvidence, "mcp_write", true);
+    store.putEvidence(prepared.setupRunId, currentEvidence);
     const currentProfile = {
       ...seedProfile(prepared.founderId, "snapshot-history-current", currentEvidence.evidenceId),
       displayName: "Current Founder",
@@ -1330,31 +1362,30 @@ describe("InMemoryBizForgeDataStore", () => {
       setupRunId: prepared.setupRunId,
       expectedVersion: 5,
       idempotencyKey: "confirm-history-current",
-      isSynthetic: true,
       profile: currentProfile,
     } as const;
-    store.confirmFounderProfile(currentConfirmation);
+    const currentConfirmedProfile = store.confirmFounderProfile(currentConfirmation).profile.value;
     store.saveResearchBundle(
-      buildSyntheticResearchBundle(currentProfile, [currentEvidence]),
-      "mcp_write",
-      true,
+      buildSyntheticResearchBundle(currentConfirmedProfile, [currentEvidence]),
     );
 
-    expect(store.getFounderProfile(oldProfile.snapshotId)).toBeUndefined();
-    expect(store.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
+    expect(store.getFounderProfile(oldConfirmedProfile.snapshotId)).toBeUndefined();
+    expect(store.getFounderProfile(currentConfirmedProfile.snapshotId)?.value).toEqual(
+      currentConfirmedProfile,
+    );
     // Evidence retention is governed by its own consent scope, independently
     // from founder version-history retention.
     expect(store.getEvidence(prepared.evidenceId)?.value).toEqual(prepared.evidence);
     expect(store.getEvidence(currentEvidence.evidenceId)?.value).toEqual(currentEvidence);
     expect(store.getLatestResearchBundle(prepared.founderId)?.value.founderProfile).toEqual(
-      currentProfile,
+      currentConfirmedProfile,
     );
 
     const snapshot = store.exportSnapshot();
     const serialized = JSON.stringify(snapshot);
     expect(serialized).not.toContain("SUPERSEDED-PROFILE-MARKER");
     expect(serialized).not.toContain("SUPERSEDED-STATE-MARKER");
-    expect(serialized).not.toContain(oldProfile.snapshotId);
+    expect(serialized).not.toContain(oldConfirmedProfile.snapshotId);
     expect(
       snapshot.transitionKeys.find(([key]) => key.endsWith(":history-sensitive-revision"))?.[1],
     ).toMatchObject({ status: "history_minimized", setupRunId: prepared.setupRunId });
@@ -1444,8 +1475,10 @@ describe("InMemoryBizForgeDataStore", () => {
 
     const restored = makeStore();
     restored.restoreSnapshot(snapshot);
-    expect(restored.getFounderProfile(oldProfile.snapshotId)).toBeUndefined();
-    expect(restored.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
+    expect(restored.getFounderProfile(oldConfirmedProfile.snapshotId)).toBeUndefined();
+    expect(restored.getFounderProfile(currentConfirmedProfile.snapshotId)?.value).toEqual(
+      currentConfirmedProfile,
+    );
     expect(restored.getEvidence(prepared.evidenceId)?.value).toEqual(prepared.evidence);
     expect(restored.getEvidence(currentEvidence.evidenceId)?.value).toEqual(currentEvidence);
     expect(() => restored.transitionSetupRun(revisionTransition)).toThrow(
@@ -1462,7 +1495,7 @@ describe("InMemoryBizForgeDataStore", () => {
     ).toThrow(/version-history consent is not active/);
     expect(restored.confirmFounderProfile(currentConfirmation)).toMatchObject({
       replayed: true,
-      profile: { value: currentProfile },
+      profile: { value: currentConfirmedProfile },
     });
     expect(snapshot.historyCleanupGeneration).toBeGreaterThan(
       snapshot.historyCleanupCompletedGeneration,
@@ -1503,10 +1536,9 @@ describe("InMemoryBizForgeDataStore", () => {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "confirm-consented-history",
-      isSynthetic: true,
       profile: oldProfile,
     } as const;
-    store.confirmFounderProfile(oldConfirmation);
+    const oldConfirmedProfile = store.confirmFounderProfile(oldConfirmation).profile.value;
     store.transitionSetupRun({
       setupRunId: prepared.setupRunId,
       expectedVersion: 4,
@@ -1520,13 +1552,13 @@ describe("InMemoryBizForgeDataStore", () => {
       displayName: "Current Founder",
       confirmedAt: "2026-08-30T12:00:00.000Z",
     };
-    store.confirmFounderProfile({
+    const currentConfirmation = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 5,
       idempotencyKey: "confirm-after-history-revision",
-      isSynthetic: true,
       profile: currentProfile,
-    });
+    } as const;
+    const currentConfirmedProfile = store.confirmFounderProfile(currentConfirmation).profile.value;
 
     const consentedSnapshot = store.exportSnapshot();
     expect(JSON.stringify(consentedSnapshot)).toContain("CONSENTED-HISTORY-PROFILE");
@@ -1552,10 +1584,10 @@ describe("InMemoryBizForgeDataStore", () => {
     );
     const staleCanonicalPointerSnapshot = {
       ...structuredClone(consentedSnapshot),
-      currentProfileSnapshotIds: [[prepared.setupRunId, oldProfile.snapshotId]] as const,
+      currentProfileSnapshotIds: [[prepared.setupRunId, oldConfirmedProfile.snapshotId]] as const,
     };
     expect(() => makeStore().restoreSnapshot(staleCanonicalPointerSnapshot)).toThrow(
-      /not the latest confirmed snapshot/,
+      /not the latest confirmed snapshot|references missing confirmed state/,
     );
     const confirmedWithoutProfileSnapshot = {
       ...structuredClone(consentedSnapshot),
@@ -1577,7 +1609,7 @@ describe("InMemoryBizForgeDataStore", () => {
                 ...record,
                 value: {
                   ...record.value,
-                  stateData: { confirmedSnapshotId: oldProfile.snapshotId },
+                  stateData: { confirmedSnapshotId: oldConfirmedProfile.snapshotId },
                 },
               },
             ] as const)
@@ -1592,16 +1624,16 @@ describe("InMemoryBizForgeDataStore", () => {
       ...structuredClone(consentedSnapshot),
       profiles: [...consentedSnapshot.profiles].reverse(),
     });
-    expect(restored.getFounderProfile(oldProfile.snapshotId)?.value).toEqual(oldProfile);
+    expect(restored.getFounderProfile(oldConfirmedProfile.snapshotId)?.value).toEqual(
+      oldConfirmedProfile,
+    );
     expect(restored.confirmFounderProfile(oldConfirmation)).toMatchObject({
       replayed: true,
       stage2HandoffEligible: false,
     });
     expect(() =>
       restored.saveResearchBundle(
-        buildSyntheticResearchBundle(oldProfile, [prepared.evidence]),
-        "mcp_write",
-        true,
+        buildSyntheticResearchBundle(oldConfirmedProfile, [prepared.evidence]),
       ),
     ).toThrow(/current confirmed founder snapshot/);
 
@@ -1622,17 +1654,21 @@ describe("InMemoryBizForgeDataStore", () => {
     );
     expect(minimizedSerialized).not.toContain("CONSENTED-HISTORY-PROFILE");
     expect(minimizedSerialized).not.toContain("CONSENTED-HISTORY-STATE");
-    expect(minimizedSerialized).not.toContain(oldProfile.snapshotId);
-    expect(restored.getFounderProfile(oldProfile.snapshotId)).toBeUndefined();
-    expect(restored.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
+    expect(minimizedSerialized).not.toContain(oldConfirmedProfile.snapshotId);
+    expect(restored.getFounderProfile(oldConfirmedProfile.snapshotId)).toBeUndefined();
+    expect(restored.getFounderProfile(currentConfirmedProfile.snapshotId)?.value).toEqual(
+      currentConfirmedProfile,
+    );
     expect(() => restored.confirmFounderProfile(oldConfirmation)).toThrow(
       /version-history consent is not active/,
     );
 
     const restarted = makeStore();
     restarted.restoreSnapshot(minimizedSnapshot);
-    expect(restarted.getFounderProfile(oldProfile.snapshotId)).toBeUndefined();
-    expect(restarted.getFounderProfile(currentProfile.snapshotId)?.value).toEqual(currentProfile);
+    expect(restarted.getFounderProfile(oldConfirmedProfile.snapshotId)).toBeUndefined();
+    expect(restarted.getFounderProfile(currentConfirmedProfile.snapshotId)?.value).toEqual(
+      currentConfirmedProfile,
+    );
   });
 
   it("keeps confirmation independent from a later atomic bundle-save failure", () => {
@@ -1642,30 +1678,28 @@ describe("InMemoryBizForgeDataStore", () => {
       founderId: "founder-atomic",
       evidenceId: "evidence-atomic",
     });
-    const generated = buildSyntheticResearchBundle(prepared.profile, [prepared.evidence]);
-    const marketEvidence = generated.evidence.find(
-      ({ evidenceId }) => evidenceId !== prepared.evidenceId,
-    );
-    if (marketEvidence === undefined) throw new Error("synthetic market evidence missing");
-    store.putEvidence(
-      prepared.setupRunId,
-      { ...marketEvidence, title: "Conflicting preexisting market evidence" },
-      "mcp_write",
-      true,
-    );
     const confirmation = store.confirmFounderProfile({
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "atomic",
-      isSynthetic: true,
       profile: prepared.profile,
     });
     expect(confirmation).toMatchObject({ run: { state: "CONFIRMED", version: 4 } });
+    const confirmedProfile = confirmation.profile.value;
+    const generated = buildSyntheticResearchBundle(confirmedProfile, [prepared.evidence]);
+    const marketEvidence = generated.evidence.find(
+      ({ evidenceId }) => evidenceId !== prepared.evidenceId,
+    );
+    if (marketEvidence === undefined) throw new Error("test market evidence missing");
+    store.putEvidence(prepared.setupRunId, {
+      ...marketEvidence,
+      title: "Conflicting preexisting market evidence",
+    });
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
-    expect(() => store.saveResearchBundle(generated, "mcp_write", true)).toThrow(
+    expect(() => store.saveResearchBundle(generated)).toThrow(
       /already exists with different content/,
     );
-    expect(store.getFounderProfile(prepared.profile.snapshotId)?.value).toEqual(prepared.profile);
+    expect(store.getFounderProfile(confirmedProfile.snapshotId)?.value).toEqual(confirmedProfile);
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
     expect(store.getSetupRun(prepared.setupRunId)?.value).toMatchObject({
       state: "CONFIRMED",
@@ -1680,7 +1714,7 @@ describe("InMemoryBizForgeDataStore", () => {
         expectedVersion: 4,
         targetState: "CONFIRMED",
         idempotencyKey: "confirm:atomic",
-        stateData: { confirmedSnapshotId: prepared.profile.snapshotId },
+        stateData: { confirmedSnapshotId: confirmedProfile.snapshotId },
       }),
     ).toThrow(/reserved for atomic founder-profile confirmation/);
   });
@@ -1690,7 +1724,6 @@ describe("InMemoryBizForgeDataStore", () => {
     store.createSetupRun({
       founderId: "founder-fail",
       setupRunId: "setup-fail",
-      isSynthetic: true,
     });
     store.recordConsent({
       consentId: "self-report-fail",
@@ -1708,7 +1741,6 @@ describe("InMemoryBizForgeDataStore", () => {
         setupRunId: "setup-fail",
         expectedVersion: 1,
         idempotencyKey: "bad-state",
-        isSynthetic: true,
         profile,
       }),
     ).toThrow(/cannot be confirmed/);
@@ -1730,7 +1762,6 @@ describe("InMemoryBizForgeDataStore", () => {
         setupRunId: "setup-fail",
         expectedVersion: 3,
         idempotencyKey: "no-consent",
-        isSynthetic: true,
         profile,
       }),
     ).toThrow(/consent is required/);
@@ -1749,7 +1780,6 @@ describe("InMemoryBizForgeDataStore", () => {
         setupRunId: "setup-fail",
         expectedVersion: 3,
         idempotencyKey: "no-evidence",
-        isSynthetic: true,
         profile,
       }),
     ).toThrow(/missing from this setup run/);
@@ -1759,7 +1789,6 @@ describe("InMemoryBizForgeDataStore", () => {
         setupRunId: "setup-fail",
         expectedVersion: 3,
         idempotencyKey: "wrong-founder",
-        isSynthetic: true,
         profile: { ...profile, founderId: "someone-else" },
       }),
     ).toThrow(/does not match/);
@@ -1775,11 +1804,11 @@ describe("InMemoryBizForgeDataStore", () => {
       bundleId: "bundle-alien",
       founderProfile: { ...bundle.founderProfile, displayName: "Not identical" },
     };
-    expect(() => store.saveResearchBundle(alien, "mcp_write", true)).toThrow(
+    expect(() => store.saveResearchBundle(alien)).toThrow(
       /identical stored confirmed founder snapshot/,
     );
     const conflicting = { ...bundle, warnings: ["different"] };
-    expect(() => store.saveResearchBundle(conflicting, "mcp_write", true)).toThrow(
+    expect(() => store.saveResearchBundle(conflicting)).toThrow(
       /already exists with different content/,
     );
     const firstEvidence = bundle.evidence[0];
@@ -1795,11 +1824,11 @@ describe("InMemoryBizForgeDataStore", () => {
       rawArtifactRef: "mock://synthetic/orphan",
     };
     expect(() =>
-      store.saveResearchBundle(
-        { ...bundle, bundleId: "bundle-orphan", evidence: [...bundle.evidence, orphanEvidence] },
-        "mcp_write",
-        true,
-      ),
+      store.saveResearchBundle({
+        ...bundle,
+        bundleId: "bundle-orphan",
+        evidence: [...bundle.evidence, orphanEvidence],
+      }),
     ).toThrow(/exactly equal the transitive set/);
 
     const marketEvidence = bundle.evidence.find(
@@ -1819,7 +1848,7 @@ describe("InMemoryBizForgeDataStore", () => {
     );
     if (inconsistentEvidence === undefined) throw new Error("rewritten evidence missing");
     inconsistentEvidence.provenance.collectionMethod = "user_input";
-    expect(() => store.saveResearchBundle(inconsistentBundle, "mcp_write", true)).toThrow(
+    expect(() => store.saveResearchBundle(inconsistentBundle)).toThrow(
       /user_input evidenceType and user_input collectionMethod/,
     );
     expect(store.getEvidence(inconsistentEvidenceId)).toBeUndefined();
@@ -1856,8 +1885,8 @@ describe("InMemoryBizForgeDataStore", () => {
       ...desiredConflictingEvidence,
       title: "Preexisting conflicting evidence",
     };
-    store.putEvidence("setup-synthetic-demo", preexistingConflict, "mcp_write", true);
-    expect(() => store.saveResearchBundle(atomicBundle, "mcp_write", true)).toThrow(
+    store.putEvidence("setup-synthetic-demo", preexistingConflict);
+    expect(() => store.saveResearchBundle(atomicBundle)).toThrow(
       /already exists with different content/,
     );
     expect(store.getEvidence(atomicFirstEvidenceId)).toBeUndefined();
@@ -1874,9 +1903,9 @@ describe("InMemoryBizForgeDataStore", () => {
       recordedAt: "2026-08-30T12:00:00.000Z",
       revokedAt: "2026-08-30T12:00:00.000Z",
     });
-    expect(() =>
-      store.saveResearchBundle({ ...bundle, bundleId: "bundle-after-revoke" }, "mcp_write", true),
-    ).toThrow(/use_confirmed_founder_snapshot_for_research/);
+    expect(() => store.saveResearchBundle({ ...bundle, bundleId: "bundle-after-revoke" })).toThrow(
+      /use_confirmed_founder_snapshot_for_research/,
+    );
   });
 
   it("deletes controllable records but keeps unresolved system obligations visible", () => {
@@ -1890,27 +1919,20 @@ describe("InMemoryBizForgeDataStore", () => {
       clientRequestId: "application-create-delete",
       setupRunId: prepared.setupRunId,
       founderId: prepared.founderId,
-      isSynthetic: true,
     });
     const siblingRun = store.createSetupRun({
       clientRequestId: "application-create-delete-sibling",
       setupRunId: "setup-delete-sibling",
       founderId: prepared.founderId,
-      isSynthetic: true,
     });
     const confirmationInput = {
       setupRunId: prepared.setupRunId,
       expectedVersion: 3,
       idempotencyKey: "confirm-delete",
-      isSynthetic: true,
       profile: prepared.profile,
     } as const;
-    store.confirmFounderProfile(confirmationInput);
-    store.saveResearchBundle(
-      buildSyntheticResearchBundle(prepared.profile, [prepared.evidence]),
-      "mcp_write",
-      true,
-    );
+    const confirmedProfile = store.confirmFounderProfile(confirmationInput).profile.value;
+    store.saveResearchBundle(buildSyntheticResearchBundle(confirmedProfile, [prepared.evidence]));
     expect(() =>
       store.requestDeletion({
         setupRunId: prepared.setupRunId,
@@ -1922,19 +1944,19 @@ describe("InMemoryBizForgeDataStore", () => {
     const deletionRecord = store.requestDeletion({
       setupRunId: prepared.setupRunId,
       founderId: prepared.founderId,
-      reason: "Synthetic test deletion",
+      reason: "Test deletion",
       idempotencyKey: "delete",
     });
     const deletion = deletionRecord.value;
     expect(deletion.status).toBe("pending_expiry");
     expect(deletion.systems).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ system: "in_memory_store", status: "completed" }),
+        expect.objectContaining({ system: "sqlite_store", status: "pending" }),
         expect.objectContaining({ system: "external_providers", status: "unverifiable" }),
         expect.objectContaining({ system: "backups", status: "pending_expiry" }),
       ]),
     );
-    expect(deletion.systems.find(({ system }) => system === "in_memory_store")?.reason).toContain(
+    expect(deletion.systems.find(({ system }) => system === "sqlite_store")?.reason).toContain(
       `setup run ${prepared.setupRunId}`,
     );
     expect(store.getSetupRun(prepared.setupRunId)).toBeUndefined();
@@ -1944,11 +1966,10 @@ describe("InMemoryBizForgeDataStore", () => {
         clientRequestId: "application-create-delete-sibling",
         setupRunId: siblingRun.value.setupRunId,
         founderId: prepared.founderId,
-        isSynthetic: true,
       }),
     ).toEqual(siblingRun);
     expect(store.getEvidence(prepared.evidenceId)).toBeUndefined();
-    expect(store.getFounderProfile(prepared.profile.snapshotId)).toBeUndefined();
+    expect(store.getFounderProfile(confirmedProfile.snapshotId)).toBeUndefined();
     expect(store.getLatestResearchBundle(prepared.founderId)).toBeUndefined();
     expect(store.getDeletionStatus(deletion.deletionRequestId)).toEqual(deletionRecord);
     expect(store.getDeletionStatus("missing")).toBeUndefined();
@@ -1957,12 +1978,10 @@ describe("InMemoryBizForgeDataStore", () => {
         clientRequestId: "application-create-delete",
         setupRunId: prepared.setupRunId,
         founderId: prepared.founderId,
-        isSynthetic: true,
       }),
     ).toThrow(/deleted setup run.*fresh clientRequestId/);
     const postDeletionCreate = store.createSetupRun({
       clientRequestId: "application-create-after-delete",
-      isSynthetic: true,
     });
     expect(postDeletionCreate.value.setupRunId).not.toBe(prepared.setupRunId);
     expect(postDeletionCreate.value.founderId).not.toBe(prepared.founderId);
@@ -1971,12 +1990,12 @@ describe("InMemoryBizForgeDataStore", () => {
       store.requestDeletion({
         setupRunId: prepared.setupRunId,
         founderId: prepared.founderId,
-        reason: "Synthetic test deletion",
+        reason: "Test deletion",
         idempotencyKey: "delete",
       }),
     ).toEqual(deletionRecord);
     expect(() => store.confirmFounderProfile(confirmationInput)).toThrow(
-      /snapshot ID was withdrawn/,
+      /was not found|was withdrawn/,
     );
     expect(() =>
       store.transitionSetupRun({
@@ -1997,12 +2016,11 @@ describe("InMemoryBizForgeDataStore", () => {
   });
 
   it("keeps persistent deletion pending until its durable system is finalized", () => {
-    const store = makePersistentStore();
+    const store = makeStore();
     store.createSetupRun({
       clientRequestId: "persistent-deletion-create",
       setupRunId: "setup-persistent-deletion",
       founderId: "founder-persistent-deletion",
-      isSynthetic: false,
     });
     const request = {
       setupRunId: "setup-persistent-deletion",
@@ -2031,7 +2049,7 @@ describe("InMemoryBizForgeDataStore", () => {
     expect(store.getDeletionStatus(pending.value.deletionRequestId)).toEqual(completed);
     expect(store.requestDeletion(request)).toEqual(completed);
 
-    const restored = makePersistentStore();
+    const restored = makeStore();
     restored.restoreSnapshot(store.exportSnapshot());
     expect(restored.requestDeletion(request)).toEqual(completed);
     expect(() =>

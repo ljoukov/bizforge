@@ -1,4 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,29 +7,51 @@ import { join } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { EvidenceItemSchema } from "../../src/domain/evidence.js";
-import { ConfirmedFounderProfileSnapshotSchema } from "../../src/domain/founder-profile.js";
+import { type EvidenceItem, EvidenceItemSchema } from "../../src/domain/evidence.js";
+import {
+  type ConfirmedFounderProfileSnapshot,
+  ConfirmedFounderProfileSnapshotSchema,
+} from "../../src/domain/founder-profile.js";
+import { type ResearchBundle, ResearchBundleSchema } from "../../src/domain/research-bundle.js";
 import type { BizForgeDataStore } from "../../src/mcp/data-store.js";
-import { createBizForgeHttpServer, listenForBizForgeMcp } from "../../src/mcp/http-server.js";
+import {
+  closeBizForgeHttpServer,
+  createBizForgeHttpServer,
+  listenForBizForgeMcp,
+} from "../../src/mcp/http-server.js";
 import { createConfiguredBizForgeDataStore } from "../../src/mcp/server.js";
 import { SqliteBizForgeDataStore } from "../../src/mcp/sqlite-data-store.js";
-import {
-  buildSyntheticResearchBundle,
-  createSeededBizForgeDataStore,
-} from "../fixtures/mock-data.js";
 
 type JsonObject = Record<string, unknown>;
 
-const createRequestIds = {
-  missingMockAcceptance: "00000000-0000-4000-8000-000000000001",
-  seededReplay: "00000000-0000-4000-8000-000000000002",
-  rejectedRealData: "00000000-0000-4000-8000-000000000003",
-  generatedRun: "00000000-0000-4000-8000-000000000004",
-  explicitReplay: "00000000-0000-4000-8000-000000000005",
-  endToEnd: "00000000-0000-4000-8000-000000000006",
-  persistent: "00000000-0000-4000-8000-000000000007",
-  persistentSynthetic: "00000000-0000-4000-8000-000000000008",
-} as const;
+const CREATE_REQUEST_ID = "00000000-0000-4000-8000-000000000007";
+const CAPTURED_AT = "2026-08-01T12:00:00.000Z";
+const CONFIRMED_AT = "2026-08-29T12:00:00.000Z";
+const MARKET_OBSERVED_AT = "2026-08-28T12:00:00.000Z";
+const confidence = { lower: 0.55, estimate: 0.72, upper: 0.84 };
+
+const expectedTools = [
+  "bizforge_get_data_status",
+  "bizforge_create_founder_setup_run",
+  "bizforge_get_founder_setup_run",
+  "bizforge_transition_founder_setup_run",
+  "bizforge_record_consent",
+  "bizforge_get_consent",
+  "bizforge_put_evidence",
+  "bizforge_get_evidence",
+  "bizforge_validate_founder_profile_snapshot",
+  "bizforge_save_confirmed_founder_profile",
+  "bizforge_get_confirmed_founder_profile",
+  "bizforge_request_founder_data_deletion",
+  "bizforge_get_deletion_status",
+  "bizforge_save_research_bundle",
+  "bizforge_get_research_bundle",
+  "bizforge_get_latest_research_bundle",
+  "bizforge_list_opportunities",
+  "bizforge_get_opportunity",
+  "bizforge_get_market_signals",
+  "bizforge_get_growth_chart_data",
+] as const;
 
 function asObject(value: unknown): JsonObject {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -41,828 +64,366 @@ function payloadOf(result: { structuredContent?: unknown }): JsonObject {
   return asObject(asObject(result.structuredContent).payload);
 }
 
-async function startServer(store: BizForgeDataStore = createSeededBizForgeDataStore()) {
+function resourcePayload(text: string): JsonObject {
+  const envelope = asObject(JSON.parse(text));
+  expect(Object.keys(envelope).sort()).toEqual(["contentSha256", "payload", "schemaVersion"]);
+  expect(envelope.schemaVersion).toBe("1.0.0");
+  expect(envelope.contentSha256).toMatch(/^[0-9a-f]{64}$/);
+  return asObject(envelope.payload);
+}
+
+const observedClaim = (claimId: string, evidenceId: string, statement: string) => ({
+  claimId,
+  kind: "observed" as const,
+  statement,
+  evidenceIds: [evidenceId],
+  confidence,
+  createdAt: CONFIRMED_AT,
+});
+
+const inferredClaim = (claimId: string, evidenceId: string, statement: string) => ({
+  claimId,
+  kind: "inferred" as const,
+  statement,
+  evidenceIds: [evidenceId],
+  rationale: "The bounded evidence supports this inference, subject to validation.",
+  confidence,
+  createdAt: CONFIRMED_AT,
+});
+
+const assumptionClaim = (claimId: string, statement: string) => ({
+  claimId,
+  kind: "assumption" as const,
+  statement,
+  evidenceIds: [],
+  rationale: "Buyer interviews have not yet tested this proposition.",
+  validationPlan: "Interview five budget owners and request a paid pilot commitment.",
+  confidence: { lower: 0.15, estimate: 0.35, upper: 0.55 },
+  createdAt: CONFIRMED_AT,
+});
+
+function buildPersistentResearchBundle(
+  profile: ConfirmedFounderProfileSnapshot,
+  founderEvidence: EvidenceItem,
+): ResearchBundle {
+  const marketEvidenceId = "evidence-market-growth";
+  const baselineWindow = {
+    start: "2026-02-01T00:00:00.000Z",
+    end: "2026-04-30T23:59:59.000Z",
+  };
+  const currentWindow = {
+    start: "2026-05-01T00:00:00.000Z",
+    end: MARKET_OBSERVED_AT,
+  };
+  const marketEvidence: EvidenceItem = {
+    evidenceId: marketEvidenceId,
+    evidenceType: "market_report",
+    title: "Workflow automation demand comparison",
+    summary: "The bounded collection increased from 24 baseline records to 39 current records.",
+    provenance: {
+      provider: "Prepared integration dataset",
+      collectionMethod: "manual_import",
+      canonicalUrl: "https://example.com/research/workflow-demand",
+      sourceRecordId: "workflow-growth-2026",
+      retrievedAt: MARKET_OBSERVED_AT,
+      publishedAt: MARKET_OBSERVED_AT,
+      contentSha256: "c".repeat(64),
+    },
+    observedAt: MARKET_OBSERVED_AT,
+    rawArtifactRef: "artifact://research/workflow-growth-2026",
+    locator: { jsonPointer: "/measurements/0" },
+    extraction: { method: "manual", version: "integration-v1" },
+    attributes: { baselineValue: 24, currentValue: 39 },
+    tags: ["growth", "workflow-automation"],
+  };
+  const intervention = assumptionClaim(
+    "claim-intervention-assumption",
+    "A buyer may pay to automate preparation while retaining human approval.",
+  );
+
+  return ResearchBundleSchema.parse({
+    schemaVersion: "1.0.0",
+    bundleId: "bundle-workflow-growth",
+    bundleVersion: 1,
+    runId: "research-workflow-growth",
+    founderProfile: profile,
+    researchWindow: { start: baselineWindow.start, end: currentWindow.end },
+    evidence: [founderEvidence, marketEvidence],
+    marketSignals: [
+      {
+        signalId: "signal-workflow-growth",
+        market: "Operations teams",
+        name: "Demand growth for workflow output",
+        description: "A bounded comparison using identical collection rules in both windows.",
+        evidenceIds: [marketEvidenceId],
+        measurement: {
+          metric: "matching_records",
+          value: 39,
+          unit: "records",
+          direction: "rising",
+          currentWindow,
+          baselineWindow,
+          baselineValue: 24,
+          absoluteChange: 15,
+          percentageChange: 62.5,
+          sampleSize: 39,
+          distinctEntityCount: 31,
+          methodology: "Count deduplicated records using the same query in both windows.",
+          coverageNote: "Bounded collection covering 31 distinct entities.",
+        },
+        claims: {
+          observed: [
+            observedClaim(
+              "claim-signal-observed",
+              marketEvidenceId,
+              "The collection contains 39 current matches and 24 baseline matches.",
+            ),
+          ],
+          inferred: [],
+          assumptions: [],
+        },
+        confidence,
+        calculatedAt: CONFIRMED_AT,
+      },
+    ],
+    opportunities: [
+      {
+        opportunityId: "opportunity-workflow-automation",
+        founderProfileSnapshotId: profile.snapshotId,
+        title: "Human-approved workflow output automation",
+        summary: "Automate repeatable output preparation while preserving human approval.",
+        marketSignalIds: ["signal-workflow-growth"],
+        evidenceIds: [marketEvidenceId, founderEvidence.evidenceId],
+        scarcityHypothesis: {
+          hypothesisId: "hypothesis-workflow-capacity",
+          title: "Make routine workflow output abundant while preserving approval",
+          market: "Operations teams",
+          valueChain: [
+            {
+              stageId: "stage-prepare",
+              name: "Prepare workflow output",
+              actor: "Operations specialist",
+              input: "Approved source records",
+              output: "Prepared deliverable",
+              currentProcess: "A specialist manually prepares each deliverable.",
+            },
+            {
+              stageId: "stage-approve",
+              name: "Approve deliverable",
+              actor: "Workflow owner",
+              input: "Prepared deliverable",
+              output: "Approved deliverable",
+              currentProcess: "A human owner reviews policy and quality before release.",
+            },
+          ],
+          scarceResource: "Specialist preparation time",
+          scarcityMechanism: "Each additional deliverable consumes specialist effort.",
+          claims: {
+            observed: [
+              observedClaim(
+                "claim-scarcity-observed",
+                marketEvidenceId,
+                "The collection describes repeated demand for manually prepared output.",
+              ),
+            ],
+            inferred: [
+              inferredClaim(
+                "claim-scarcity-inferred",
+                marketEvidenceId,
+                "The comparison suggests pressure on specialist workflow capacity.",
+              ),
+            ],
+            assumptions: [],
+          },
+          aiIntervention: {
+            description: "Draft routine deliverables from approved inputs for human review.",
+            makesAbundant: "Review-ready workflow output",
+            collapsedStageIds: ["stage-prepare"],
+            claims: { observed: [], inferred: [], assumptions: [intervention] },
+          },
+          abundantOutcome: "More review-ready deliverables without proportional preparation work",
+          directBeneficiary: "Operations specialist",
+          economicBuyer: "Head of operations",
+          successorBottleneck: {
+            description: "Human approval and policy ownership become the limiting step.",
+            claims: {
+              observed: [],
+              inferred: [
+                inferredClaim(
+                  "claim-successor-inferred",
+                  marketEvidenceId,
+                  "Approval capacity becomes the next likely bottleneck.",
+                ),
+              ],
+              assumptions: [],
+            },
+          },
+          confidence,
+          createdAt: CONFIRMED_AT,
+        },
+        offering: {
+          description: "A human-approved automation service for one repeatable workflow.",
+          smallestSellableWedge: "A paid pilot automating one weekly deliverable type.",
+          revenueModel: "Fixed-fee pilot followed by a per-workflow subscription.",
+          valueCaptureMechanism: "Own the approval policy and workflow history.",
+          claims: {
+            observed: [],
+            inferred: [
+              inferredClaim(
+                "claim-offering-inferred",
+                marketEvidenceId,
+                "A narrow pilot can test the scarcity hypothesis.",
+              ),
+            ],
+            assumptions: [],
+          },
+        },
+        founderFit: {
+          rating: "plausible",
+          explanation: "The confirmed founder competency is relevant to the initial workflow.",
+          claims: {
+            observed: [],
+            inferred: [
+              inferredClaim(
+                "claim-founder-fit-inferred",
+                founderEvidence.evidenceId,
+                "The founder evidence supports initial implementation ability.",
+              ),
+            ],
+            assumptions: [],
+          },
+        },
+        defensibilityClaims: {
+          observed: [],
+          inferred: [],
+          assumptions: [
+            assumptionClaim(
+              "claim-defensibility-assumption",
+              "Customer-specific approval history may create defensibility.",
+            ),
+          ],
+        },
+        counterEvidence: {
+          status: "NOT_FOUND",
+          searchSummary: "Reviewed the bounded evidence set for disconfirming evidence.",
+          warning: "No counter-evidence was found in the limited research window.",
+          claims: { observed: [], inferred: [], assumptions: [] },
+        },
+        falsificationExperiment: {
+          assumptionClaimIds: [intervention.claimId],
+          method: "Offer five operations leaders a paid workflow pilot.",
+          successCriterion: "At least one paid-pilot commitment.",
+          failureCriterion: "No buyer accepts the proposed pilot conditions.",
+          maximumDurationDays: 14,
+          maximumBudgetUsd: 500,
+        },
+        confidence,
+        generatedAt: CONFIRMED_AT,
+      },
+    ],
+    generatedAt: CONFIRMED_AT,
+    warnings: ["Economic-buyer text remains a hypothesis without buyer-specific evidence."],
+  });
+}
+
+async function startServer(store: BizForgeDataStore) {
   const server = createBizForgeHttpServer({ store });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => resolve());
   });
   const address = server.address() as AddressInfo;
-  const baseUrl = `http://127.0.0.1:${address.port}`;
-  return { server, baseUrl };
+  return { server, baseUrl: `http://127.0.0.1:${address.port}` };
+}
+
+async function requestStatus(url: string, headers: Record<string, string>): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { method: "GET", headers }, (response) => {
+      response.resume();
+      response.once("end", () => resolve(response.statusCode ?? 0));
+    });
+    request.once("error", reject);
+    request.end();
+  });
 }
 
 describe("BizForge MCP HTTP server", () => {
   const cleanup: Array<() => Promise<void>> = [];
 
   afterEach(async () => {
-    await Promise.all(cleanup.splice(0).map((close) => close()));
+    for (const close of cleanup.splice(0).reverse()) await close();
   });
 
-  it("serves the complete synthetic Step 1 -> Step 2 -> Step 3 flow", async () => {
-    const { server, baseUrl } = await startServer();
-    const client = new Client({ name: "bizforge-test", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
-    cleanup.push(async () => {
-      await client.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    });
-    await client.connect(transport);
-
-    const listed = await client.listTools();
-    const expectedTools = [
-      "bizforge_get_data_status",
-      "bizforge_create_founder_setup_run",
-      "bizforge_get_founder_setup_run",
-      "bizforge_transition_founder_setup_run",
-      "bizforge_record_consent",
-      "bizforge_get_consent",
-      "bizforge_put_evidence",
-      "bizforge_get_evidence",
-      "bizforge_validate_founder_profile_snapshot",
-      "bizforge_save_confirmed_founder_profile",
-      "bizforge_get_confirmed_founder_profile",
-      "bizforge_request_founder_data_deletion",
-      "bizforge_get_deletion_status",
-      "bizforge_save_research_bundle",
-      "bizforge_get_research_bundle",
-      "bizforge_get_latest_research_bundle",
-      "bizforge_list_opportunities",
-      "bizforge_get_opportunity",
-      "bizforge_get_market_signals",
-      "bizforge_get_growth_chart_data",
-    ];
-    expect(listed.tools.map(({ name }) => name)).toEqual(expectedTools);
-    expect(
-      listed.tools.find(({ name }) => name === "bizforge_get_data_status")?.annotations,
-    ).toMatchObject({
-      readOnlyHint: true,
-      destructiveHint: false,
-    });
-    expect(
-      listed.tools.find(({ name }) => name === "bizforge_request_founder_data_deletion")
-        ?.annotations,
-    ).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
-    for (const tool of listed.tools) {
-      const outputSchema = asObject(tool.outputSchema);
-      expect(outputSchema.type, `${tool.name} must return an object envelope`).toBe("object");
-      const properties = asObject(outputSchema.properties);
-      const payloadSchema = asObject(properties.payload);
-      expect(
-        Object.keys(payloadSchema).length,
-        `${tool.name} must expose an explicit payload output schema`,
-      ).toBeGreaterThan(0);
-    }
-    const growthOutputSchema = listed.tools.find(
-      ({ name }) => name === "bizforge_get_growth_chart_data",
-    )?.outputSchema;
-    expect(growthOutputSchema).toBeDefined();
-    expect(JSON.stringify(growthOutputSchema)).not.toContain('"prefixItems"');
-    expect(JSON.stringify(growthOutputSchema)).not.toContain('"items":false');
-    const createSetupTool = listed.tools.find(
-      ({ name }) => name === "bizforge_create_founder_setup_run",
-    );
-    if (createSetupTool === undefined) throw new Error("missing setup creation tool");
-    const createSetupInputSchema = asObject(createSetupTool.inputSchema);
-    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain("founderId");
-    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain("setupRunId");
-    expect(createSetupInputSchema.required as unknown[] | undefined).not.toContain(
-      "clientRequestId",
-    );
-    expect(createSetupTool.title).toContain("server-assigned");
-    expect(createSetupTool.description).toContain("never ask the end user");
-    expect(createSetupTool.annotations).toMatchObject({ idempotentHint: false });
-    expect(asObject(asObject(createSetupInputSchema.properties).clientRequestId)).toMatchObject({
-      format: "uuid",
-    });
-    expect(
-      asObject(asObject(createSetupInputSchema.properties).clientRequestId).description,
-    ).toContain("never request it from an end user");
-    expect(asObject(asObject(createSetupInputSchema.properties).founderId).description).toContain(
-      "Never request this ID from an end user",
-    );
-    expect(asObject(asObject(createSetupInputSchema.properties).setupRunId).description).toContain(
-      "Never request this ID from an end user",
-    );
-
-    const status = await client.callTool({ name: "bizforge_get_data_status", arguments: {} });
-    expect(asObject(status.structuredContent)).toMatchObject({
-      dataMode: "mock",
-      storageMode: "mock",
-      storageBackend: "memory",
-      persistenceStatus: "mock_ephemeral",
-      isMock: true,
-      ephemeral: true,
-    });
-    expect(payloadOf(status)).toMatchObject({
-      capabilities: {
-        step2ResearchHandoff: true,
-        buyerEvidenceProjection: false,
-        opportunityRerank: false,
-      },
-    });
-    const missingMockAcceptance = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.missingMockAcceptance,
-        founderId: "founder-missing-mock-acceptance",
-        isSynthetic: true,
-      },
-    });
-    expect(missingMockAcceptance.isError).toBe(true);
-    expect(JSON.stringify(missingMockAcceptance.content)).toContain("acceptMockStorage: true");
-
-    const seededRunReplay = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.seededReplay,
-        founderId: "founder-synthetic-demo",
-        setupRunId: "setup-synthetic-demo",
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(asObject(seededRunReplay.structuredContent).source).toBe("mock_seed");
-    const seededConsentReplay = await client.callTool({
-      name: "bizforge_record_consent",
-      arguments: {
-        acceptMockStorage: true,
-        consent: {
-          consentId: "consent-self-report-synthetic-demo",
-          setupRunId: "setup-synthetic-demo",
-          founderId: "founder-synthetic-demo",
-          scope: "retain_minimized_founder_self_report",
-          status: "active",
-          sourceUrls: [],
-          recordedAt: "2026-08-01T12:00:00.000Z",
-          grantedAt: "2026-08-01T12:00:00.000Z",
-        },
-      },
-    });
-    expect(asObject(seededConsentReplay.structuredContent).source).toBe("mock_seed");
-
-    const seededEvidenceResult = await client.callTool({
-      name: "bizforge_get_evidence",
-      arguments: { evidenceId: "evidence-founder-synthetic-demo" },
-    });
-    const seededEvidence = payloadOf(seededEvidenceResult).evidence as JsonObject;
-    const seededEvidenceReplay = await client.callTool({
-      name: "bizforge_put_evidence",
-      arguments: {
-        setupRunId: "setup-synthetic-demo",
-        evidence: seededEvidence,
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(asObject(seededEvidenceReplay.structuredContent).source).toBe("mock_seed");
-
-    const seededProfileResult = await client.callTool({
-      name: "bizforge_get_confirmed_founder_profile",
-      arguments: { snapshotId: "snapshot-synthetic-demo" },
-    });
-    const seededProfile = payloadOf(seededProfileResult).profile as JsonObject;
-    const seededConfirmationReplay = await client.callTool({
-      name: "bizforge_save_confirmed_founder_profile",
-      arguments: {
-        setupRunId: "setup-synthetic-demo",
-        expectedVersion: 3,
-        idempotencyKey: "seed-confirm",
-        profile: seededProfile,
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(
-      seededConfirmationReplay.isError,
-      JSON.stringify(seededConfirmationReplay.content),
-    ).not.toBe(true);
-    expect(asObject(seededConfirmationReplay.structuredContent).source).toBe("mock_seed");
-
-    const seededBundleResult = await client.callTool({
-      name: "bizforge_get_latest_research_bundle",
-      arguments: { founderId: "founder-synthetic-demo" },
-    });
-    const seededBundle = payloadOf(seededBundleResult).bundle as JsonObject;
-    const seededBundleReplay = await client.callTool({
-      name: "bizforge_save_research_bundle",
-      arguments: {
-        bundle: seededBundle,
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(asObject(seededBundleReplay.structuredContent).source).toBe("mock_seed");
-    for (const [name, arguments_] of [
-      ["bizforge_get_founder_setup_run", { setupRunId: "missing" }],
-      ["bizforge_get_evidence", { evidenceId: "missing" }],
-      ["bizforge_get_confirmed_founder_profile", { snapshotId: "missing" }],
-      ["bizforge_get_research_bundle", { bundleId: "missing" }],
-      ["bizforge_get_deletion_status", { deletionRequestId: "missing" }],
-    ] as const) {
-      expect((await client.callTool({ name, arguments: arguments_ })).isError).toBe(true);
-    }
-    const rejectedRealData = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.rejectedRealData,
-        founderId: "founder-rejected-real-data",
-        isSynthetic: false,
-        acceptMockStorage: true,
-      },
-    });
-    expect(rejectedRealData.isError).toBe(true);
-    expect(JSON.stringify(rejectedRealData.content)).toContain("synthetic records only");
-    const legacyUnkeyedRun = payloadOf(
-      await client.callTool({
-        name: "bizforge_create_founder_setup_run",
-        arguments: {
-          isSynthetic: true,
-          acceptMockStorage: true,
-        },
-      }),
-    );
-    expect(asObject(legacyUnkeyedRun.run).setupRunId).toMatch(/^setup-/);
-    expect(asObject(legacyUnkeyedRun.run).founderId).toMatch(/^founder-/);
-    const generatedRunArguments = {
-      clientRequestId: createRequestIds.generatedRun,
-      isSynthetic: true,
-      acceptMockStorage: true,
-    };
-    const autoRun = payloadOf(
-      await client.callTool({
-        name: "bizforge_create_founder_setup_run",
-        arguments: generatedRunArguments,
-      }),
-    );
-    expect(asObject(autoRun.run).setupRunId).toMatch(/^setup-/);
-    expect(asObject(autoRun.run).founderId).toMatch(/^founder-/);
-    const retriedAutoRun = payloadOf(
-      await client.callTool({
-        name: "bizforge_create_founder_setup_run",
-        arguments: generatedRunArguments,
-      }),
-    );
-    expect(retriedAutoRun.run).toEqual(autoRun.run);
-    const conflictingAutoRun = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: { ...generatedRunArguments, founderId: "founder-conflicting-retry" },
-    });
-    expect(conflictingAutoRun.isError).toBe(true);
-    expect(JSON.stringify(conflictingAutoRun.content)).toContain(
-      "clientRequestId was already used with different parameters",
-    );
-    const explicitReplayWithoutFounder = payloadOf(
-      await client.callTool({
-        name: "bizforge_create_founder_setup_run",
-        arguments: {
-          clientRequestId: createRequestIds.explicitReplay,
-          setupRunId: "setup-synthetic-demo",
-          isSynthetic: true,
-          acceptMockStorage: true,
-        },
-      }),
-    );
-    expect(explicitReplayWithoutFounder).toMatchObject({
-      run: {
-        setupRunId: "setup-synthetic-demo",
-        founderId: "founder-synthetic-demo",
-      },
-    });
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_latest_research_bundle",
-          arguments: {},
-        }),
-      ),
-    ).toHaveProperty("bundle");
-
-    const seedEvidence = seededEvidence;
-
-    const founderId = "founder-e2e";
-    const setupRunId = "setup-e2e";
-    const evidenceId = "evidence-e2e";
-    const snapshotId = "snapshot-e2e";
-    const createResult = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.endToEnd,
-        founderId,
-        setupRunId,
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(payloadOf(createResult)).toMatchObject({
-      run: { state: "CONSENT_PENDING", version: 1 },
-    });
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_founder_setup_run",
-          arguments: { setupRunId },
-        }),
-      ),
-    ).toMatchObject({ run: { founderId, version: 1 } });
-
-    for (const [consentId, scope] of [
-      ["consent-self-report-e2e", "retain_minimized_founder_self_report"],
-      ["consent-retain-e2e", "retain_minimized_founder_snapshot"],
-      ["consent-research-e2e", "use_confirmed_founder_snapshot_for_research"],
-    ]) {
-      const consentResult = await client.callTool({
-        name: "bizforge_record_consent",
-        arguments: {
-          acceptMockStorage: true,
-          consent: {
-            consentId,
-            setupRunId,
-            founderId,
-            scope,
-            status: "active",
-            sourceUrls: [],
-            recordedAt: "2026-08-01T12:00:00.000Z",
-            grantedAt: "2026-08-01T12:00:00.000Z",
-          },
-        },
-      });
-      expect(consentResult.isError).not.toBe(true);
-    }
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_consent",
-          arguments: { setupRunId, scope: "retain_minimized_founder_snapshot" },
-        }),
-      ).consents,
-    ).toHaveLength(1);
-
-    const evidence = {
-      ...seedEvidence,
-      evidenceId,
-      title: "Synthetic e2e founder competency",
-      provenance: {
-        ...asObject(seedEvidence.provenance),
-        sourceRecordId: "synthetic-e2e-input",
-      },
-      rawArtifactRef: "mock://synthetic/e2e-founder-input",
-    };
-    const putResult = await client.callTool({
-      name: "bizforge_put_evidence",
-      arguments: { setupRunId, evidence, isSynthetic: true, acceptMockStorage: true },
-    });
-    expect(payloadOf(putResult)).toMatchObject({ evidence: { evidenceId } });
-
-    await client.callTool({
-      name: "bizforge_transition_founder_setup_run",
-      arguments: {
-        setupRunId,
-        expectedVersion: 1,
-        targetState: "INTERVIEW",
-        idempotencyKey: "e2e-interview",
-        acceptMockStorage: true,
-      },
-    });
-    const review = await client.callTool({
-      name: "bizforge_transition_founder_setup_run",
-      arguments: {
-        setupRunId,
-        expectedVersion: 2,
-        targetState: "DRAFT_REVIEW",
-        idempotencyKey: "e2e-review",
-        stateData: { readyForDraft: true },
-        acceptMockStorage: true,
-      },
-    });
-    expect(payloadOf(review)).toMatchObject({ run: { state: "DRAFT_REVIEW", version: 3 } });
-
-    const profile = {
-      snapshotId,
-      founderId,
-      displayName: "Synthetic E2E Founder",
-      competencies: [
-        {
-          name: "Workflow automation",
-          level: "working",
-          evidenceIds: [evidenceId],
-          confidence: { lower: 0.25, estimate: 0.5, upper: 0.75 },
-        },
-      ],
-      businessAppetite: {
-        hoursPerWeek: 12,
-        capitalBudgetUsd: 1_500,
-        timeToFirstRevenueDays: 35,
-        teamSize: 1,
-        preferredOfferTypes: ["hybrid"],
-        preferredCustomerTypes: ["smb"],
-        salesTolerance: "medium",
-        riskTolerance: "medium",
-        regulatoryTolerance: "low",
-      },
-      constraints: ["Synthetic e2e only"],
-      accessAdvantages: [],
-      sourceEvidenceIds: [evidenceId],
-      claims: { observed: [], inferred: [], assumptions: [] },
-      capturedAt: "2026-08-01T12:00:00.000Z",
-      confirmedAt: "2026-08-29T12:00:00.000Z",
-    };
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_validate_founder_profile_snapshot",
-          arguments: { snapshot: { ...profile, confirmedAt: undefined }, confirmationLevel: false },
-        }),
-      ),
-    ).toMatchObject({ valid: true, validator: "FounderProfileSnapshotSchema" });
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_validate_founder_profile_snapshot",
-          arguments: { snapshot: { ...profile, confirmedAt: undefined }, confirmationLevel: true },
-        }),
-      ),
-    ).toMatchObject({ valid: false, validator: "ConfirmedFounderProfileSnapshotSchema" });
-
-    const published = payloadOf(
-      await client.callTool({
-        name: "bizforge_save_confirmed_founder_profile",
-        arguments: {
-          setupRunId,
-          expectedVersion: 3,
-          idempotencyKey: "e2e-confirm",
-          profile,
-          isSynthetic: true,
-          acceptMockStorage: true,
-        },
-      }),
-    );
-    expect(published).toMatchObject({
-      profile: { snapshotId },
-      run: { setupRunId, state: "CONFIRMED" },
-      replayed: false,
-      stage2HandoffEligible: false,
-    });
-    expect(Object.keys(published).sort()).toEqual(
-      ["profile", "replayed", "run", "stage2HandoffEligible"].sort(),
-    );
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_confirmed_founder_profile",
-          arguments: { snapshotId },
-        }),
-      ),
-    ).toMatchObject({ profile: { snapshotId } });
-
-    const researchBundle = buildSyntheticResearchBundle(
-      ConfirmedFounderProfileSnapshotSchema.parse(profile),
-      [EvidenceItemSchema.parse(evidence)],
-    );
-    const savedBundle = await client.callTool({
-      name: "bizforge_save_research_bundle",
-      arguments: {
-        bundle: researchBundle,
-        isSynthetic: true,
-        acceptMockStorage: true,
-      },
-    });
-    expect(savedBundle.isError, JSON.stringify(savedBundle.content)).not.toBe(true);
-    expect(payloadOf(savedBundle)).toMatchObject({
-      bundle: {
-        bundleId: researchBundle.bundleId,
-        founderProfile: { snapshotId },
-      },
-    });
-
-    const latest = payloadOf(
-      await client.callTool({
-        name: "bizforge_get_latest_research_bundle",
-        arguments: { founderId },
-      }),
-    );
-    const bundle = asObject(latest.bundle);
-    expect(bundle).toMatchObject({ founderProfile: { snapshotId } });
-    const bundleId = String(bundle.bundleId);
-    const bundleVersion = Number(bundle.bundleVersion);
-    const opportunities = asObject(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_list_opportunities",
-          arguments: { bundleId, bundleVersion },
-        }),
-      ),
-    ).opportunities as JsonObject[];
-    expect(opportunities[0]).toMatchObject({ buyerEvidenceStatus: "unlinked/hypothesis_only" });
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_list_opportunities",
-          arguments: { founderId },
-        }),
-      ),
-    ).toHaveProperty("opportunities");
-    const opportunityId = String(opportunities[0]?.opportunityId);
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_opportunity",
-          arguments: { bundleId, bundleVersion, opportunityId },
-        }),
-      ),
-    ).toMatchObject({ buyerEvidenceStatus: "unlinked/hypothesis_only" });
-
-    for (const [name, toolArguments, message] of [
-      [
-        "bizforge_list_opportunities",
-        { bundleId: "missing-bundle", bundleVersion: 1 },
-        "No matching research bundle",
-      ],
-      [
-        "bizforge_get_opportunity",
-        { bundleId, bundleVersion, opportunityId: "missing-opportunity" },
-        "Opportunity missing-opportunity was not found",
-      ],
-      [
-        "bizforge_get_latest_research_bundle",
-        { founderId: "missing-founder" },
-        "No matching research bundle",
-      ],
-    ] as const) {
-      const missingResult = await client.callTool({ name, arguments: toolArguments });
-      expect(missingResult.isError).toBe(true);
-      expect(JSON.stringify(missingResult.content)).toContain(message);
-    }
-
-    const signals = payloadOf(
-      await client.callTool({
-        name: "bizforge_get_market_signals",
-        arguments: { bundleId, bundleVersion },
-      }),
-    ).marketSignals as JsonObject[];
-    expect(signals).toHaveLength(1);
-    const signalId = String(signals[0]?.signalId);
-    const growth = payloadOf(
-      await client.callTool({
-        name: "bizforge_get_growth_chart_data",
-        arguments: { bundleId, bundleVersion, signalId },
-      }),
-    );
-    expect(growth).toMatchObject({
-      charts: [
-        {
-          eligible: true,
-          absoluteChange: 15,
-          percentageChange: 62.5,
-          sampleSize: 39,
-          distinctEntityCount: 31,
-          inferenceStatus: "synthetic_evidence_backed_inference",
-        },
-      ],
-    });
-    expect(
-      (
-        await client.callTool({
-          name: "bizforge_get_growth_chart_data",
-          arguments: { bundleId, bundleVersion, signalId: "missing" },
-        })
-      ).isError,
-    ).toBe(true);
-
-    for (const [direction, values] of [
-      ["concentrated", { value: 39, absoluteChange: 15, percentageChange: 62.5 }],
-      ["unknown", { value: 39, absoluteChange: 15, percentageChange: 62.5 }],
-      ["falling", { value: 20, absoluteChange: -4, percentageChange: -16.666666666666664 }],
-      ["stable", { value: 24, absoluteChange: 0, percentageChange: 0 }],
-    ] as const) {
-      const directionBundle = structuredClone(bundle);
-      directionBundle.bundleId = `bundle-direction-${direction}`;
-      const signal = (directionBundle.marketSignals as JsonObject[])[0];
-      if (signal === undefined) throw new Error("expected market signal");
-      const measurement = asObject(signal.measurement);
-      signal.measurement = { ...measurement, direction, ...values };
-      const savedDirection = await client.callTool({
-        name: "bizforge_save_research_bundle",
-        arguments: {
-          bundle: directionBundle,
-          isSynthetic: true,
-          acceptMockStorage: true,
-        },
-      });
-      expect(savedDirection.isError).not.toBe(true);
-      expect(
-        payloadOf(
-          await client.callTool({
-            name: "bizforge_get_growth_chart_data",
-            arguments: { bundleId: directionBundle.bundleId },
-          }),
-        ),
-      ).toMatchObject({
-        charts: [{ eligible: false, inferenceStatus: "insufficient_growth_inputs" }],
-      });
-    }
-
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_research_bundle",
-          arguments: { bundleId, bundleVersion },
-        }),
-      ),
-    ).toMatchObject({ bundle: { bundleId, bundleVersion } });
-    const savedAgain = await client.callTool({
-      name: "bizforge_save_research_bundle",
-      arguments: { bundle, isSynthetic: true, acceptMockStorage: true },
-    });
-    expect(savedAgain.isError).not.toBe(true);
-
-    const evidenceResource = await client.readResource({
-      uri: `bizforge://evidence/${evidenceId}`,
-    });
-    expect(evidenceResource.contents[0]).toMatchObject({ mimeType: "application/json" });
-    const evidenceContent = evidenceResource.contents[0];
-    if (evidenceContent === undefined || !("text" in evidenceContent)) {
-      throw new Error("Expected text evidence resource content");
-    }
-    expect(JSON.parse(evidenceContent.text)).toMatchObject({
-      payload: { evidence: { evidenceId } },
-    });
-    const founderResource = await client.readResource({
-      uri: `bizforge://founder-snapshots/${snapshotId}`,
-    });
-    expect(founderResource.contents[0]).toMatchObject({ mimeType: "application/json" });
-    const bundleResource = await client.readResource({
-      uri: `bizforge://research-bundles/${bundleId}/versions/${bundleVersion}`,
-    });
-    expect(bundleResource.contents).toHaveLength(1);
-    const opportunityResource = await client.readResource({
-      uri: `bizforge://opportunities/${opportunityId}`,
-    });
-    expect(opportunityResource.contents).toHaveLength(1);
-    await expect(
-      client.readResource({ uri: "bizforge://founder-snapshots/missing" }),
-    ).rejects.toThrow(/not found/);
-    await expect(client.readResource({ uri: "bizforge://evidence/missing" })).rejects.toThrow(
-      /not found/,
-    );
-    await expect(
-      client.readResource({
-        uri: `bizforge://research-bundles/${bundleId}/versions/not-a-number`,
-      }),
-    ).rejects.toThrow(/positive integer/);
-    await expect(client.readResource({ uri: "bizforge://opportunities/missing" })).rejects.toThrow(
-      /not found/,
-    );
-
-    const deletionResult = await client.callTool({
-      name: "bizforge_request_founder_data_deletion",
-      arguments: {
-        setupRunId,
-        founderId,
-        reason: "E2E cleanup",
-        idempotencyKey: "e2e-delete",
-        acceptMockStorage: true,
-      },
-    });
-    expect(asObject(deletionResult.structuredContent).source).toBe("mcp_write");
-    const deletion = payloadOf(deletionResult);
-    const deletionRequestId = String(asObject(deletion.deletion).deletionRequestId);
-    const deletionReplay = await client.callTool({
-      name: "bizforge_request_founder_data_deletion",
-      arguments: {
-        setupRunId,
-        founderId,
-        reason: "E2E cleanup",
-        idempotencyKey: "e2e-delete",
-        acceptMockStorage: true,
-      },
-    });
-    expect(asObject(deletionReplay.structuredContent).source).toBe("mcp_write");
-    expect(payloadOf(deletionReplay)).toEqual(deletion);
-    expect(
-      payloadOf(
-        await client.callTool({
-          name: "bizforge_get_deletion_status",
-          arguments: { deletionRequestId },
-        }),
-      ),
-    ).toMatchObject({ deletion: { status: "pending_expiry" } });
-  });
-
-  it("persists the backend-neutral tool contract across a SQLite restart", async () => {
+  it("serves the persistent Step 1 -> Step 2 -> Step 3 contract across a SQLite restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bizforge-mcp-http-"));
     const databasePath = join(directory, "bizforge.sqlite");
     const firstStore = new SqliteBizForgeDataStore(databasePath);
-    const { server, baseUrl } = await startServer(firstStore);
-    const client = new Client({ name: "bizforge-persistent-test", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`));
-    let clientClosed = false;
-    let serverClosed = false;
+    const first = await startServer(firstStore);
+    const firstClient = new Client({ name: "bizforge-persistent-test", version: "1.0.0" });
+    let firstClosed = false;
     let restartedStore: SqliteBizForgeDataStore | undefined;
     let restartedServer: ReturnType<typeof createBizForgeHttpServer> | undefined;
     let restartedClient: Client | undefined;
-    let restartedClientClosed = false;
-    let restartedServerClosed = false;
+    let restartedClosed = false;
     cleanup.push(async () => {
-      if (!clientClosed) await client.close();
-      if (!serverClosed && server.listening) {
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (!firstClosed) {
+        await firstClient.close().catch(() => undefined);
+        await closeBizForgeHttpServer(first.server, { forceCloseAfterMs: 100 }).catch(
+          () => undefined,
+        );
       }
-      if (!restartedClientClosed && restartedClient !== undefined) await restartedClient.close();
-      if (!restartedServerClosed && restartedServer?.listening === true) {
-        await new Promise<void>((resolve) => restartedServer?.close(() => resolve()));
+      if (!restartedClosed) {
+        await restartedClient?.close().catch(() => undefined);
+        if (restartedServer !== undefined) {
+          await closeBizForgeHttpServer(restartedServer, { forceCloseAfterMs: 100 }).catch(
+            () => undefined,
+          );
+        }
       }
       firstStore.close();
       restartedStore?.close();
       await rm(directory, { recursive: true, force: true });
     });
-    await client.connect(transport);
+    await firstClient.connect(new StreamableHTTPClientTransport(new URL(`${first.baseUrl}/mcp`)));
 
-    const listed = await client.listTools();
+    const listed = await firstClient.listTools();
+    expect(listed.tools.map(({ name }) => name)).toEqual(expectedTools);
+    expect(JSON.stringify(listed.tools)).not.toMatch(
+      /temporary demo|fictional founder|alternate storage/i,
+    );
     for (const tool of listed.tools) {
       const outputSchema = asObject(tool.outputSchema);
-      expect(Object.keys(asObject(outputSchema.properties))).toEqual(["dataNotice", "payload"]);
+      expect(Object.keys(asObject(outputSchema.properties))).toEqual(["payload"]);
       expect(outputSchema.required).toEqual(["payload"]);
-      expect(tool.description?.toLowerCase()).not.toMatch(
-        /mock|synthetic|demo|ephemeral|storage adapter|provenance/,
-      );
     }
-    const persistentSaveTool = listed.tools.find(
-      ({ name }) => name === "bizforge_save_confirmed_founder_profile",
-    );
-    if (persistentSaveTool === undefined) throw new Error("missing profile save tool");
-    expect(JSON.stringify(persistentSaveTool.outputSchema)).not.toMatch(
-      /mockStep2|founderId|setupRunId|profile"|run"/,
-    );
-    const persistentStatusTool = listed.tools.find(
-      ({ name }) => name === "bizforge_get_data_status",
-    );
-    if (persistentStatusTool === undefined) throw new Error("missing data status tool");
-    expect(JSON.stringify(persistentStatusTool.outputSchema)).not.toMatch(
-      /isMock|storageBackend|storageMode|mockStep2|ephemeral|provenance|fixture|source/i,
-    );
-    const persistentCreateTool = listed.tools.find(
+    expect(
+      listed.tools.find(({ name }) => name === "bizforge_get_data_status")?.annotations,
+    ).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(
+      listed.tools.find(({ name }) => name === "bizforge_request_founder_data_deletion")
+        ?.annotations,
+    ).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+    const createTool = listed.tools.find(
       ({ name }) => name === "bizforge_create_founder_setup_run",
     );
-    if (persistentCreateTool === undefined) throw new Error("missing setup creation tool");
-    expect(asObject(asObject(persistentCreateTool.inputSchema).properties)).not.toHaveProperty(
-      "founderId",
-    );
-    expect(asObject(asObject(persistentCreateTool.inputSchema).properties)).not.toHaveProperty(
-      "setupRunId",
-    );
-    const persistentGrowthTool = listed.tools.find(
-      ({ name }) => name === "bizforge_get_growth_chart_data",
-    );
-    if (persistentGrowthTool === undefined) throw new Error("missing growth chart tool");
-    expect(JSON.stringify(persistentGrowthTool.outputSchema)).not.toMatch(
-      /mock|synthetic|demo|ephemeral|fixture/i,
-    );
-    const deletionTool = listed.tools.find(
-      ({ name }) => name === "bizforge_request_founder_data_deletion",
-    );
-    if (deletionTool === undefined) throw new Error("missing setup-run deletion tool");
-    expect(deletionTool.title).toContain("setup-run");
-    expect(deletionTool.description).toContain("one setup run");
-    for (const toolName of [
-      "bizforge_create_founder_setup_run",
-      "bizforge_transition_founder_setup_run",
-      "bizforge_record_consent",
-      "bizforge_put_evidence",
-      "bizforge_save_confirmed_founder_profile",
-      "bizforge_request_founder_data_deletion",
-      "bizforge_save_research_bundle",
-    ]) {
-      const tool = listed.tools.find(({ name }) => name === toolName);
-      if (tool === undefined) throw new Error(`missing tool ${toolName}`);
-      const inputSchema = asObject(tool.inputSchema);
-      const properties = asObject(inputSchema.properties);
-      expect(properties).not.toHaveProperty("acceptMockStorage");
-      expect((inputSchema.required as unknown[] | undefined) ?? []).not.toContain(
-        "acceptMockStorage",
-      );
-    }
-    for (const toolName of [
-      "bizforge_create_founder_setup_run",
-      "bizforge_put_evidence",
-      "bizforge_save_confirmed_founder_profile",
-      "bizforge_save_research_bundle",
-    ]) {
-      const tool = listed.tools.find(({ name }) => name === toolName);
-      if (tool === undefined) throw new Error(`missing tool ${toolName}`);
-      const inputSchema = asObject(tool.inputSchema);
-      const properties = asObject(inputSchema.properties);
-      expect(properties).not.toHaveProperty("isSynthetic");
-      expect((inputSchema.required as unknown[] | undefined) ?? []).not.toContain("isSynthetic");
-    }
+    if (createTool === undefined) throw new Error("missing setup creation tool");
+    const createInputSchema = asObject(createTool.inputSchema);
+    expect(Object.keys(asObject(createInputSchema.properties))).toEqual(["clientRequestId"]);
+    expect(createInputSchema.required ?? []).toEqual([]);
+    expect(createTool.title).toContain("server-assigned");
+    expect(createTool.description).toContain("never ask an end user");
+    expect(asObject(asObject(createInputSchema.properties).clientRequestId)).toMatchObject({
+      format: "uuid",
+    });
+    const growthTool = listed.tools.find(({ name }) => name === "bizforge_get_growth_chart_data");
+    if (growthTool === undefined) throw new Error("missing growth chart tool");
+    expect(JSON.stringify(growthTool.outputSchema)).not.toContain('"prefixItems"');
+    expect(JSON.stringify(growthTool.outputSchema)).not.toContain('"items":false');
 
-    const status = await client.callTool({ name: "bizforge_get_data_status", arguments: {} });
+    const status = await firstClient.callTool({ name: "bizforge_get_data_status", arguments: {} });
     expect(Object.keys(asObject(status.structuredContent))).toEqual(["payload"]);
     expect(status.content).toEqual([
-      {
-        type: "text",
-        text: "BizForge is ready for founder onboarding and durable retention.",
-      },
+      { type: "text", text: "BizForge is ready for founder onboarding and durable retention." },
     ]);
     expect(payloadOf(status)).toEqual({
       persistenceReady: true,
@@ -877,48 +438,41 @@ describe("BizForge MCP HTTP server", () => {
         opportunityRerank: false,
       },
     });
-    expect(JSON.stringify(status.structuredContent)).not.toMatch(
-      /isMock|storageBackend|storageMode|mockStep2|ephemeral|provenance|fixture|source/i,
-    );
 
-    const evidenceId = "evidence-persistent";
-    const proposedSnapshotId = "snapshot-persistent";
-    const created = await client.callTool({
+    const rejectedUnknownInput = await firstClient.callTool({
       name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.persistent,
-      },
+      arguments: { clientRequestId: CREATE_REQUEST_ID, unsupportedRuntimeOverride: true },
+    });
+    expect(rejectedUnknownInput.isError).toBe(true);
+
+    const createArguments = { clientRequestId: CREATE_REQUEST_ID };
+    const created = await firstClient.callTool({
+      name: "bizforge_create_founder_setup_run",
+      arguments: createArguments,
     });
     expect(created.isError).not.toBe(true);
-    expect(Object.keys(asObject(created.structuredContent))).toEqual(["payload"]);
     const createdRun = asObject(payloadOf(created).run);
     const founderId = String(createdRun.founderId);
     const setupRunId = String(createdRun.setupRunId);
     expect(founderId).toMatch(/^founder-/);
     expect(setupRunId).toMatch(/^setup-/);
-    expect(createdRun).toMatchObject({ founderId, setupRunId, state: "CONSENT_PENDING" });
+    expect(createdRun).toMatchObject({ state: "CONSENT_PENDING", version: 1 });
     expect(created.content).toEqual([{ type: "text", text: "Setup started." }]);
-    expect(JSON.stringify(created.content)).not.toMatch(
-      /mock|synthetic|demo|ephemeral|storage|provenance|source/i,
-    );
-
-    const rejectedLegacyOriginFlag = await client.callTool({
-      name: "bizforge_create_founder_setup_run",
-      arguments: {
-        clientRequestId: createRequestIds.persistentSynthetic,
-        founderId: "founder-persistent-synthetic-check",
-        setupRunId: "setup-persistent-synthetic-check",
-        isSynthetic: true,
-      },
-    });
-    expect(rejectedLegacyOriginFlag.isError).toBe(true);
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_create_founder_setup_run",
+          arguments: createArguments,
+        }),
+      ).run,
+    ).toEqual(createdRun);
 
     for (const [consentId, scope] of [
       ["consent-self-report-persistent", "retain_minimized_founder_self_report"],
       ["consent-retain-persistent", "retain_minimized_founder_snapshot"],
       ["consent-research-persistent", "use_confirmed_founder_snapshot_for_research"],
-    ]) {
-      const result = await client.callTool({
+    ] as const) {
+      const result = await firstClient.callTool({
         name: "bizforge_record_consent",
         arguments: {
           consent: {
@@ -928,65 +482,111 @@ describe("BizForge MCP HTTP server", () => {
             scope,
             status: "active",
             sourceUrls: [],
-            recordedAt: "2026-08-01T12:00:00.000Z",
-            grantedAt: "2026-08-01T12:00:00.000Z",
+            recordedAt: CAPTURED_AT,
+            grantedAt: CAPTURED_AT,
           },
         },
       });
-      expect(result.isError).not.toBe(true);
-      expect(Object.keys(asObject(result.structuredContent))).toEqual(["payload"]);
-      expect(JSON.stringify(result.content)).not.toMatch(
-        /mock|synthetic|demo|ephemeral|storage|provenance|source/i,
-      );
+      expect(result.isError, JSON.stringify(result.content)).not.toBe(true);
     }
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_consent",
+          arguments: { setupRunId, scope: "retain_minimized_founder_snapshot" },
+        }),
+      ).consents,
+    ).toHaveLength(1);
 
-    const evidence = {
-      evidenceId,
+    const evidence = EvidenceItemSchema.parse({
+      evidenceId: "evidence-persistent",
       evidenceType: "user_input",
       title: "Founder competency",
       summary: "The founder reports workflow automation experience.",
       provenance: {
-        provider: "first-party founder interview",
+        provider: "First-party founder interview",
         collectionMethod: "user_input",
         sourceRecordId: "persistent-founder-input",
-        retrievedAt: "2026-08-01T12:00:00.000Z",
+        retrievedAt: CAPTURED_AT,
         contentSha256: "b".repeat(64),
       },
-      observedAt: "2026-08-01T12:00:00.000Z",
-      rawArtifactRef: `bizforge://evidence/${evidenceId}`,
+      observedAt: CAPTURED_AT,
+      rawArtifactRef: "artifact://founder/evidence-persistent",
       locator: { jsonPointer: "/founder/competencies/0" },
-      extraction: { method: "manual", version: "test-v1" },
+      extraction: { method: "manual", version: "integration-v1" },
       attributes: {},
       tags: ["founder-self-report"],
-    };
-    const storedEvidence = await client.callTool({
+    });
+    const storedEvidence = await firstClient.callTool({
       name: "bizforge_put_evidence",
       arguments: { setupRunId, evidence },
     });
     expect(storedEvidence.isError).not.toBe(true);
-    expect(Object.keys(asObject(storedEvidence.structuredContent))).toEqual(["payload"]);
-    expect(payloadOf(storedEvidence)).toMatchObject({ evidence: { evidenceId } });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_put_evidence",
+          arguments: { setupRunId, evidence },
+        }),
+      ),
+    ).toEqual(payloadOf(storedEvidence));
+    const conflictingEvidence = await firstClient.callTool({
+      name: "bizforge_put_evidence",
+      arguments: {
+        setupRunId,
+        evidence: { ...evidence, summary: "Conflicting immutable evidence content." },
+      },
+    });
+    expect(conflictingEvidence.isError).toBe(true);
 
-    for (const [expectedVersion, targetState, idempotencyKey] of [
-      [1, "INTERVIEW", "persistent-interview"],
-      [2, "DRAFT_REVIEW", "persistent-review"],
-    ] as const) {
-      const transition = await client.callTool({
-        name: "bizforge_transition_founder_setup_run",
-        arguments: { setupRunId, expectedVersion, targetState, idempotencyKey },
-      });
-      expect(transition.isError).not.toBe(true);
-    }
+    const interviewArguments = {
+      setupRunId,
+      expectedVersion: 1,
+      targetState: "INTERVIEW",
+      idempotencyKey: "persistent-interview",
+    };
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_transition_founder_setup_run",
+          arguments: interviewArguments,
+        }),
+      ),
+    ).toMatchObject({ run: { state: "INTERVIEW", version: 2 }, replayed: false });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_transition_founder_setup_run",
+          arguments: interviewArguments,
+        }),
+      ),
+    ).toMatchObject({ run: { state: "INTERVIEW", version: 2 }, replayed: true });
+    const conflictingTransition = await firstClient.callTool({
+      name: "bizforge_transition_founder_setup_run",
+      arguments: { ...interviewArguments, targetState: "DRAFT_REVIEW" },
+    });
+    expect(conflictingTransition.isError).toBe(true);
+    const review = await firstClient.callTool({
+      name: "bizforge_transition_founder_setup_run",
+      arguments: {
+        setupRunId,
+        expectedVersion: 2,
+        targetState: "DRAFT_REVIEW",
+        idempotencyKey: "persistent-review",
+      },
+    });
+    expect(payloadOf(review)).toMatchObject({ run: { state: "DRAFT_REVIEW", version: 3 } });
 
-    const profile = {
+    const proposedSnapshotId = "snapshot-client-proposal";
+    const profile = ConfirmedFounderProfileSnapshotSchema.parse({
       snapshotId: proposedSnapshotId,
       founderId,
-      displayName: "Persistent Founder",
+      displayName: "Prepared Founder",
       competencies: [
         {
           name: "Workflow automation",
           level: "working",
-          evidenceIds: [evidenceId],
+          evidenceIds: [evidence.evidenceId],
           confidence: { lower: 0.25, estimate: 0.5, upper: 0.75 },
         },
       ],
@@ -1003,19 +603,43 @@ describe("BizForge MCP HTTP server", () => {
       },
       constraints: [],
       accessAdvantages: [],
-      sourceEvidenceIds: [evidenceId],
+      sourceEvidenceIds: [evidence.evidenceId],
       claims: { observed: [], inferred: [], assumptions: [] },
-      capturedAt: "2026-08-01T12:00:00.000Z",
-      confirmedAt: "2026-08-29T12:00:00.000Z",
+      capturedAt: CAPTURED_AT,
+      confirmedAt: CONFIRMED_AT,
+    });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_validate_founder_profile_snapshot",
+          arguments: {
+            snapshot: { ...profile, confirmedAt: undefined },
+            confirmationLevel: false,
+          },
+        }),
+      ),
+    ).toMatchObject({ valid: true, validator: "FounderProfileSnapshotSchema" });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_validate_founder_profile_snapshot",
+          arguments: {
+            snapshot: { ...profile, confirmedAt: undefined },
+            confirmationLevel: true,
+          },
+        }),
+      ),
+    ).toMatchObject({ valid: false, validator: "ConfirmedFounderProfileSnapshotSchema" });
+
+    const confirmationArguments = {
+      setupRunId,
+      expectedVersion: 3,
+      idempotencyKey: "persistent-confirm",
+      profile,
     };
-    const published = await client.callTool({
+    const published = await firstClient.callTool({
       name: "bizforge_save_confirmed_founder_profile",
-      arguments: {
-        setupRunId,
-        expectedVersion: 3,
-        idempotencyKey: "persistent-confirm",
-        profile,
-      },
+      arguments: confirmationArguments,
     });
     expect(published.isError, JSON.stringify(published.content)).not.toBe(true);
     const publishedPayload = payloadOf(published);
@@ -1024,56 +648,198 @@ describe("BizForge MCP HTTP server", () => {
       /^snapshot-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(canonicalSnapshotId).not.toBe(proposedSnapshotId);
-    expect(asObject(published.structuredContent)).toEqual({
-      payload: {
-        snapshotId: canonicalSnapshotId,
-        setupState: "CONFIRMED",
-        stage2HandoffEligible: true,
-      },
-    });
-    expect(published.content).toEqual([
-      {
-        type: "text",
-        text: `Founder profile confirmed. Snapshot ${canonicalSnapshotId}; setup CONFIRMED; downstream research eligible.`,
-      },
-    ]);
     expect(publishedPayload).toEqual({
       snapshotId: canonicalSnapshotId,
       setupState: "CONFIRMED",
       stage2HandoffEligible: true,
     });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_save_confirmed_founder_profile",
+          arguments: confirmationArguments,
+        }),
+      ),
+    ).toEqual(publishedPayload);
 
-    const replayed = await client.callTool({
-      name: "bizforge_save_confirmed_founder_profile",
-      arguments: {
-        setupRunId,
-        expectedVersion: 3,
-        idempotencyKey: "persistent-confirm",
-        profile,
+    const canonicalProfile = ConfirmedFounderProfileSnapshotSchema.parse(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_confirmed_founder_profile",
+          arguments: { snapshotId: canonicalSnapshotId },
+        }),
+      ).profile,
+    );
+    const researchBundle = buildPersistentResearchBundle(canonicalProfile, evidence);
+    const savedBundle = await firstClient.callTool({
+      name: "bizforge_save_research_bundle",
+      arguments: { bundle: researchBundle },
+    });
+    expect(savedBundle.isError, JSON.stringify(savedBundle.content)).not.toBe(true);
+    expect(payloadOf(savedBundle)).toMatchObject({
+      bundle: {
+        bundleId: researchBundle.bundleId,
+        founderProfile: { snapshotId: canonicalSnapshotId },
       },
     });
-    expect(replayed.isError, JSON.stringify(replayed.content)).not.toBe(true);
-    expect(payloadOf(replayed)).toEqual(publishedPayload);
-
-    await client.close();
-    clientClosed = true;
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    serverClosed = true;
-    expect(firstStore.getFounderProfile(proposedSnapshotId)).toBeUndefined();
-    expect(firstStore.getFounderProfile(canonicalSnapshotId)?.value).toMatchObject({
-      snapshotId: canonicalSnapshotId,
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_save_research_bundle",
+          arguments: { bundle: researchBundle },
+        }),
+      ),
+    ).toEqual(payloadOf(savedBundle));
+    const conflictingBundle = await firstClient.callTool({
+      name: "bizforge_save_research_bundle",
+      arguments: {
+        bundle: { ...researchBundle, warnings: [...researchBundle.warnings, "Conflict."] },
+      },
     });
+    expect(conflictingBundle.isError).toBe(true);
+
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_latest_research_bundle",
+          arguments: { founderId },
+        }),
+      ),
+    ).toMatchObject({ bundle: { bundleId: researchBundle.bundleId } });
+    const opportunities = payloadOf(
+      await firstClient.callTool({
+        name: "bizforge_list_opportunities",
+        arguments: { bundleId: researchBundle.bundleId, bundleVersion: 1 },
+      }),
+    ).opportunities as JsonObject[];
+    expect(opportunities).toHaveLength(1);
+    expect(opportunities[0]).toMatchObject({
+      opportunityId: "opportunity-workflow-automation",
+      buyerEvidenceStatus: "unlinked/hypothesis_only",
+    });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_opportunity",
+          arguments: {
+            bundleId: researchBundle.bundleId,
+            bundleVersion: 1,
+            opportunityId: "opportunity-workflow-automation",
+          },
+        }),
+      ),
+    ).toMatchObject({
+      opportunity: { opportunityId: "opportunity-workflow-automation" },
+      buyerEvidenceStatus: "unlinked/hypothesis_only",
+    });
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_market_signals",
+          arguments: { bundleId: researchBundle.bundleId, bundleVersion: 1 },
+        }),
+      ).marketSignals,
+    ).toHaveLength(1);
+    expect(
+      payloadOf(
+        await firstClient.callTool({
+          name: "bizforge_get_growth_chart_data",
+          arguments: {
+            bundleId: researchBundle.bundleId,
+            bundleVersion: 1,
+            signalId: "signal-workflow-growth",
+          },
+        }),
+      ),
+    ).toMatchObject({
+      charts: [
+        {
+          eligible: true,
+          absoluteChange: 15,
+          percentageChange: 62.5,
+          sampleSize: 39,
+          distinctEntityCount: 31,
+          inferenceStatus: "evidence_backed_inference",
+        },
+      ],
+    });
+    expect(
+      (
+        await firstClient.callTool({
+          name: "bizforge_get_growth_chart_data",
+          arguments: { bundleId: researchBundle.bundleId, signalId: "missing" },
+        })
+      ).isError,
+    ).toBe(true);
+
+    for (const [name, arguments_] of [
+      ["bizforge_get_founder_setup_run", { setupRunId: "missing" }],
+      ["bizforge_get_evidence", { evidenceId: "missing" }],
+      ["bizforge_get_confirmed_founder_profile", { snapshotId: "missing" }],
+      ["bizforge_get_research_bundle", { bundleId: "missing" }],
+      ["bizforge_get_deletion_status", { deletionRequestId: "missing" }],
+    ] as const) {
+      expect((await firstClient.callTool({ name, arguments: arguments_ })).isError).toBe(true);
+    }
+
+    const evidenceResource = await firstClient.readResource({
+      uri: `bizforge://evidence/${evidence.evidenceId}`,
+    });
+    const evidenceContent = evidenceResource.contents[0];
+    if (evidenceContent === undefined || !("text" in evidenceContent)) {
+      throw new Error("Expected text evidence resource content");
+    }
+    expect(resourcePayload(evidenceContent.text)).toMatchObject({
+      evidence: { evidenceId: evidence.evidenceId },
+    });
+    const founderResource = await firstClient.readResource({
+      uri: `bizforge://founder-snapshots/${canonicalSnapshotId}`,
+    });
+    const founderContent = founderResource.contents[0];
+    if (founderContent === undefined || !("text" in founderContent)) {
+      throw new Error("Expected text founder resource content");
+    }
+    expect(resourcePayload(founderContent.text)).toMatchObject({
+      profile: { snapshotId: canonicalSnapshotId },
+    });
+    const bundleResource = await firstClient.readResource({
+      uri: `bizforge://research-bundles/${researchBundle.bundleId}/versions/1`,
+    });
+    expect(bundleResource.contents).toHaveLength(1);
+    const opportunityResource = await firstClient.readResource({
+      uri: "bizforge://opportunities/opportunity-workflow-automation",
+    });
+    expect(opportunityResource.contents).toHaveLength(1);
+    await expect(
+      firstClient.readResource({ uri: "bizforge://founder-snapshots/missing" }),
+    ).rejects.toThrow(/not found/);
+    await expect(
+      firstClient.readResource({
+        uri: `bizforge://research-bundles/${researchBundle.bundleId}/versions/not-a-number`,
+      }),
+    ).rejects.toThrow(/positive integer/);
+
+    await firstClient.close();
+    await closeBizForgeHttpServer(first.server, { forceCloseAfterMs: 100 });
     firstStore.close();
+    firstClosed = true;
 
     restartedStore = new SqliteBizForgeDataStore(databasePath);
     const restarted = await startServer(restartedStore);
     restartedServer = restarted.server;
     restartedClient = new Client({ name: "bizforge-restarted-test", version: "1.0.0" });
-    const restartedTransport = new StreamableHTTPClientTransport(
-      new URL(`${restarted.baseUrl}/mcp`),
+    await restartedClient.connect(
+      new StreamableHTTPClientTransport(new URL(`${restarted.baseUrl}/mcp`)),
     );
-    await restartedClient.connect(restartedTransport);
 
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_create_founder_setup_run",
+          arguments: createArguments,
+        }),
+      ).run,
+    ).toMatchObject({ setupRunId, founderId, state: "CONFIRMED", version: 4 });
     expect(
       payloadOf(
         await restartedClient.callTool({
@@ -1085,90 +851,111 @@ describe("BizForge MCP HTTP server", () => {
     expect(
       payloadOf(
         await restartedClient.callTool({
-          name: "bizforge_get_evidence",
-          arguments: { evidenceId },
+          name: "bizforge_get_research_bundle",
+          arguments: { bundleId: researchBundle.bundleId, bundleVersion: 1 },
         }),
       ),
-    ).toMatchObject({ evidence: { evidenceId, rawArtifactRef: evidence.rawArtifactRef } });
+    ).toMatchObject({ bundle: { bundleId: researchBundle.bundleId, bundleVersion: 1 } });
     expect(
       payloadOf(
         await restartedClient.callTool({
-          name: "bizforge_get_confirmed_founder_profile",
-          arguments: { snapshotId: canonicalSnapshotId },
+          name: "bizforge_save_confirmed_founder_profile",
+          arguments: confirmationArguments,
         }),
       ),
-    ).toMatchObject({ profile: { snapshotId: canonicalSnapshotId, founderId } });
-
-    const replayedAfterRestart = await restartedClient.callTool({
-      name: "bizforge_save_confirmed_founder_profile",
-      arguments: {
-        setupRunId,
-        expectedVersion: 3,
-        idempotencyKey: "persistent-confirm",
-        profile,
-      },
-    });
-    expect(replayedAfterRestart.isError, JSON.stringify(replayedAfterRestart.content)).not.toBe(
-      true,
-    );
-    expect(payloadOf(replayedAfterRestart)).toEqual(publishedPayload);
+    ).toEqual(publishedPayload);
 
     const persistedEvidenceResource = await restartedClient.readResource({
-      uri: `bizforge://evidence/${evidenceId}`,
+      uri: `bizforge://evidence/${evidence.evidenceId}`,
     });
     const persistedEvidenceContent = persistedEvidenceResource.contents[0];
     if (persistedEvidenceContent === undefined || !("text" in persistedEvidenceContent)) {
       throw new Error("Expected text evidence resource content after restart");
     }
-    expect(JSON.parse(persistedEvidenceContent.text)).toMatchObject({
-      storageBackend: "sqlite",
-      isMock: false,
-      payload: {
-        evidence: {
-          evidenceId,
-          summary: evidence.summary,
-          rawArtifactRef: evidence.rawArtifactRef,
-        },
-      },
+    expect(resourcePayload(persistedEvidenceContent.text)).toMatchObject({
+      evidence: { evidenceId: evidence.evidenceId, summary: evidence.summary },
     });
 
+    const deletionArguments = {
+      setupRunId,
+      founderId,
+      reason: "Founder requested removal",
+      idempotencyKey: "persistent-delete",
+    };
+    const deletionResult = await restartedClient.callTool({
+      name: "bizforge_request_founder_data_deletion",
+      arguments: deletionArguments,
+    });
+    expect(deletionResult.isError, JSON.stringify(deletionResult.content)).not.toBe(true);
+    const deletion = payloadOf(deletionResult);
+    const deletionRecord = asObject(deletion.deletion);
+    const deletionRequestId = String(deletionRecord.deletionRequestId);
+    expect(deletionRecord).toMatchObject({ setupRunId, founderId, status: "pending_expiry" });
+    expect(deletionRecord.systems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ system: "sqlite_store", status: "completed" }),
+      ]),
+    );
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_request_founder_data_deletion",
+          arguments: deletionArguments,
+        }),
+      ),
+    ).toEqual(deletion);
+    const conflictingDeletion = await restartedClient.callTool({
+      name: "bizforge_request_founder_data_deletion",
+      arguments: { ...deletionArguments, reason: "Conflicting retry" },
+    });
+    expect(conflictingDeletion.isError).toBe(true);
+    expect(
+      payloadOf(
+        await restartedClient.callTool({
+          name: "bizforge_get_deletion_status",
+          arguments: { deletionRequestId },
+        }),
+      ),
+    ).toEqual(deletion);
+    for (const [name, arguments_] of [
+      ["bizforge_get_founder_setup_run", { setupRunId }],
+      ["bizforge_get_evidence", { evidenceId: evidence.evidenceId }],
+      ["bizforge_get_confirmed_founder_profile", { snapshotId: canonicalSnapshotId }],
+      ["bizforge_get_research_bundle", { bundleId: researchBundle.bundleId }],
+    ] as const) {
+      expect((await restartedClient.callTool({ name, arguments: arguments_ })).isError).toBe(true);
+    }
+    const deletedCreationReplay = await restartedClient.callTool({
+      name: "bizforge_create_founder_setup_run",
+      arguments: createArguments,
+    });
+    expect(deletedCreationReplay.isError).toBe(true);
+
     await restartedClient.close();
-    restartedClientClosed = true;
-    await new Promise<void>((resolve) => restarted.server.close(() => resolve()));
-    restartedServerClosed = true;
+    await closeBizForgeHttpServer(restarted.server, { forceCloseAfterMs: 100 });
     restartedStore.close();
+    restartedClosed = true;
   });
 
-  it("always configures local SQLite even when a legacy mock mode is present", async () => {
+  it("configures only file-backed SQLite stores", async () => {
     const directory = await mkdtemp(join(tmpdir(), "bizforge-store-config-"));
     cleanup.push(() => rm(directory, { recursive: true, force: true }));
 
-    const persistentStore = createConfiguredBizForgeDataStore({
-      cwd: directory,
-      environment: {},
-    });
-    expect(persistentStore).toBeInstanceOf(SqliteBizForgeDataStore);
-    expect(persistentStore.getDataStatus()).toMatchObject({
+    const defaultStore = createConfiguredBizForgeDataStore({ cwd: directory, environment: {} });
+    expect(defaultStore).toBeInstanceOf(SqliteBizForgeDataStore);
+    expect(defaultStore.getDataStatus()).toMatchObject({
       dataMode: "persistent",
       storageBackend: "sqlite",
-      ephemeral: false,
+      persistenceStatus: "persistent",
     });
-    if (persistentStore instanceof SqliteBizForgeDataStore) persistentStore.close();
+    if (defaultStore instanceof SqliteBizForgeDataStore) defaultStore.close();
 
-    const legacyModeStore = createConfiguredBizForgeDataStore({
+    const configuredStore = createConfiguredBizForgeDataStore({
       cwd: directory,
-      environment: {
-        BIZFORGE_STORAGE_MODE: "mock",
-        BIZFORGE_DB_PATH: "legacy-mode.sqlite",
-      },
+      environment: { BIZFORGE_DB_PATH: "configured.sqlite" },
     });
-    expect(legacyModeStore).toBeInstanceOf(SqliteBizForgeDataStore);
-    expect(legacyModeStore.getDataStatus()).toMatchObject({
-      dataMode: "persistent",
-      storageBackend: "sqlite",
-      ephemeral: false,
-    });
-    if (legacyModeStore instanceof SqliteBizForgeDataStore) legacyModeStore.close();
+    expect(configuredStore).toBeInstanceOf(SqliteBizForgeDataStore);
+    if (configuredStore instanceof SqliteBizForgeDataStore) configuredStore.close();
     expect(() =>
       createConfiguredBizForgeDataStore({
         cwd: directory,
@@ -1181,9 +968,8 @@ describe("BizForge MCP HTTP server", () => {
     const directory = await mkdtemp(join(tmpdir(), "bizforge-owned-store-"));
     let server: Awaited<ReturnType<typeof listenForBizForgeMcp>> | undefined;
     cleanup.push(async () => {
-      const activeServer = server;
-      if (activeServer?.listening === true) {
-        await new Promise<void>((resolve) => activeServer.close(() => resolve()));
+      if (server !== undefined) {
+        await closeBizForgeHttpServer(server, { forceCloseAfterMs: 100 }).catch(() => undefined);
       }
       await rm(directory, { recursive: true, force: true });
     });
@@ -1199,29 +985,34 @@ describe("BizForge MCP HTTP server", () => {
     const address = server.address() as AddressInfo;
     await expect(
       fetch(`http://127.0.0.1:${address.port}/healthz`).then((response) => response.json()),
-    ).resolves.toMatchObject({
+    ).resolves.toEqual({
       ok: true,
-      dataMode: "persistent",
+      service: "bizforge-mcp",
+      persistenceReady: true,
       storageBackend: "sqlite",
-      ephemeral: false,
     });
 
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await closeBizForgeHttpServer(server, { forceCloseAfterMs: 100 });
     const reopened = new SqliteBizForgeDataStore(join(directory, "profile.sqlite"));
     expect(reopened.getDataStatus()).toMatchObject({ storageBackend: "sqlite" });
     reopened.close();
   });
 
-  it("serves health and rejects cross-origin or unknown routes", async () => {
-    const { server, baseUrl } = await startServer();
-    cleanup.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
-    await expect(
-      fetch(`${baseUrl}/healthz`).then((response) => response.json()),
-    ).resolves.toMatchObject({
+  it("serves health and rejects hostile hosts, cross-origin requests, and unknown routes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "bizforge-http-security-"));
+    const store = new SqliteBizForgeDataStore(join(directory, "bizforge.sqlite"));
+    const { server, baseUrl } = await startServer(store);
+    cleanup.push(async () => {
+      await closeBizForgeHttpServer(server, { forceCloseAfterMs: 100 }).catch(() => undefined);
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+
+    await expect(fetch(`${baseUrl}/healthz`).then((response) => response.json())).resolves.toEqual({
       ok: true,
-      dataMode: "mock",
-      storageBackend: "memory",
-      ephemeral: true,
+      service: "bizforge-mcp",
+      persistenceReady: true,
+      storageBackend: "sqlite",
     });
     expect((await fetch(`${baseUrl}/missing`)).status).toBe(404);
     expect(
@@ -1231,5 +1022,6 @@ describe("BizForge MCP HTTP server", () => {
         })
       ).status,
     ).toBe(403);
+    expect(await requestStatus(`${baseUrl}/healthz`, { host: "evil.example" })).toBe(403);
   });
 });

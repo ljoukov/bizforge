@@ -46,11 +46,10 @@ Call `bizforge_get_data_status` first and require healthy persistent storage tha
 records. Keep backend, origin, and source fields internal during normal onboarding. If durable
 persistence is unavailable, do not call an external profile connector or collect profile data.
 
-An approved public-profile connector must also be attached. The
-TrueForge sandbox is temporary working space, not the durable evidence store; never use a
-sandbox path as a durable
-`rawArtifactRef`. If any required durable capability is unavailable, do not call the external
-source. Explain the limitation and continue with interview-only setup.
+An approved public-profile connector must also be attached. Use the TrueForge sandbox only for
+computation; never use a sandbox path as a canonical `rawArtifactRef`. If any required capability
+is unavailable, do not call the external source. Explain the limitation and continue with
+interview-only setup.
 
 The BizForge MCP tool schemas are authoritative. Record each singular `ConsentRecord` through
 `bizforge_record_consent`, canonical evidence through `bizforge_put_evidence`, and the conceptual
@@ -113,7 +112,7 @@ when persistence fails. Reconcile ambiguous writes with the matching read tool.
    `bizforge://evidence/{evidenceId}` as `rawArtifactRef`; the stored minimized EvidenceItem and
    its locator excerpt must contain enough of the source extract to resolve that reference. Do not
    persist the complete provider payload unless a separate, explicit retention scope authorizes
-   it. Delete temporary sandbox copies after durable persistence is confirmed.
+   it. Delete sandbox copies after canonical persistence is confirmed.
 9. **Classify claims correctly.** A direct description of source text is `observed`. A
    competency conclusion drawn from it is `inferred` and needs evidence IDs, rationale, and
    bounded confidence. A title or seniority label alone does not prove mastery.

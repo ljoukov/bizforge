@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,6 @@ import {
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { InMemoryBizForgeDataStore } from "../../src/mcp/data-store.js";
 import {
   type BizForgeSignalTarget,
   installBizForgeShutdownHandlers,
@@ -28,6 +28,16 @@ const MODERN_PROTOCOL_VERSION = "2026-07-28";
 
 describe("BizForge MCP runtime lifecycle", () => {
   const cleanup: Array<() => Promise<void>> = [];
+
+  async function openPersistentStore(prefix: string): Promise<SqliteBizForgeDataStore> {
+    const directory = await mkdtemp(join(tmpdir(), prefix));
+    const store = new SqliteBizForgeDataStore(join(directory, "bizforge.sqlite"));
+    cleanup.push(async () => {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+    });
+    return store;
+  }
 
   afterEach(async () => {
     vi.restoreAllMocks();
@@ -124,9 +134,10 @@ describe("BizForge MCP runtime lifecycle", () => {
   });
 
   it("gracefully closes an active MCP subscription stream", async () => {
+    const store = await openPersistentStore("bizforge-subscription-close-");
     const server = await listenForBizForgeMcp({
       port: 0,
-      store: new InMemoryBizForgeDataStore(),
+      store,
     });
     cleanup.push(() => closeBizForgeHttpServer(server, { forceCloseAfterMs: 0 }));
     const address = server.address();
@@ -173,7 +184,7 @@ describe("BizForge MCP runtime lifecycle", () => {
   });
 
   it("contains request-handler failures at the HTTP response boundary", async () => {
-    const store = new InMemoryBizForgeDataStore();
+    const store = await openPersistentStore("bizforge-handler-failure-");
     vi.spyOn(store, "getDataStatus").mockImplementation(() => {
       throw new Error("injected status failure");
     });
@@ -188,7 +199,8 @@ describe("BizForge MCP runtime lifecycle", () => {
   });
 
   it("rejects an invalid close deadline without consuming the later valid shutdown", async () => {
-    const server = createBizForgeHttpServer({ store: new InMemoryBizForgeDataStore() });
+    const store = await openPersistentStore("bizforge-close-deadline-");
+    const server = createBizForgeHttpServer({ store });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
       server.listen(0, "127.0.0.1", resolve);
@@ -201,5 +213,9 @@ describe("BizForge MCP runtime lifecycle", () => {
     await expect(
       closeBizForgeHttpServer(server, { forceCloseAfterMs: 0 }),
     ).resolves.toBeUndefined();
+  });
+
+  it("treats a never-started unowned HTTP server as already closed", async () => {
+    await expect(closeBizForgeHttpServer(createServer())).resolves.toBeUndefined();
   });
 });

@@ -47,11 +47,11 @@ ordinary healthy onboarding replies, do not narrate the backend, storage mode, r
 MCP source fields, or implementation names. Surface infrastructure only when degraded, when a
 write fails, or when the founder explicitly asks. If durable persistence is unavailable, fail
 closed before collecting profile data and ask the founder to try again after the service is
-restored. Do not offer an alternate storage or test mode.
+restored. Do not offer an alternate data path.
 
 Verify the public-profile connector only if the founder requests profile enrichment and the MCP
-reports healthy persistent storage. Never use the temporary TrueForge sandbox as the durable store
-and never expose infrastructure requirements as founder questions.
+reports healthy persistent storage. Use the TrueForge sandbox only for computation; canonical
+records belong in BizForge MCP. Never expose infrastructure requirements as founder questions.
 
 ## Conversation bootstrap and internal IDs
 
@@ -152,8 +152,8 @@ records.
    host stamp `confirmedAt`, atomically recheck retention consent with `bizforge_get_consent`,
    validate the exact final artifact with `bizforge_validate_founder_profile_snapshot`, save it
    with `bizforge_save_confirmed_founder_profile`, and use the updated `CONFIRMED` run returned by
-   that atomic save. Do not issue a second state transition. For real founder data, these
-   confirmation/save steps require healthy persistent storage.
+   that atomic save. Do not issue a second state transition. These confirmation/save steps require
+   healthy persistent storage.
 4. `bizforge_save_confirmed_founder_profile` creates the canonical immutable Step 1 output that
    Step 2 and Step 3 share through the BizForge MCP. Saving that output is not itself a Stage 2
    handoff. Set `stage2HandoffEligible` only when
@@ -181,7 +181,7 @@ Deletion status must be one of `pending`, `pending_expiry`, `completed`, `failed
 
 ## Completion contract
 
-For real founder data, Step 1 is complete only when all of the following are true and
+Step 1 is complete only when all of the following are true and
 `bizforge_get_data_status` reports healthy persistent storage:
 
 - the exact displayed thesis version was explicitly confirmed;
